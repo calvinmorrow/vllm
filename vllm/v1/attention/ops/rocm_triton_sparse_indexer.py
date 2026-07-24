@@ -12,6 +12,8 @@ rocm_aiter_mla_sparse.py. Only the top-k selection step is replaced.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -50,7 +52,7 @@ def is_gfx1151_triton_sparse_indexer_available() -> bool:
 @eager_break_during_capture
 def rocm_triton_sparse_attn_indexer(
     hidden_states: torch.Tensor,
-    k_cache_prefix: str,
+    k_cache_prefix: Any,
     kv_cache: torch.Tensor,
     q_fp8: torch.Tensor,
     k: torch.Tensor,
@@ -239,7 +241,7 @@ def rocm_triton_sparse_attn_indexer(
 
 def _rocm_triton_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
-    k_cache_prefix: str,
+    k_cache_prefix: Any,
     kv_cache: torch.Tensor,
     q_fp8: torch.Tensor,
     k: torch.Tensor,
