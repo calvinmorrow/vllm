@@ -47,48 +47,14 @@ def _select_sort_n(n: int) -> int:
 
 
 @triton.jit
-def _pack_score_idx(
-    score: tl.tensor,
-    idx: tl.tensor,
-    scale: tl.constexpr,
-) -> tl.tensor:
-    """Pack score and index into float64 for sorting.
-
-    Higher score -> higher packed value.
-    Equal scores: lower index -> higher packed value (for tie-breaking).
-    """
-    # packed = score * scale - index
-    # Sorting descending: higher score first, then lower index first
+def _pack_score_idx(score, idx, scale: tl.constexpr):
+    """Pack score and index into float64 for sorting."""
     return score.to(tl.float64) * scale - idx.to(tl.float64)
 
 
 @triton.jit
-def _unpack_idx(packed: tl.tensor, scale: tl.constexpr) -> tl.tensor:
+def _unpack_idx(packed, scale: tl.constexpr):
     """Extract index from packed float64 value."""
-    # idx = round(scale - packed) when score ~ 0
-    # More robust: idx = round(-fract(packed / 1) * scale)
-    # Actually: packed = score * scale - idx
-    # So: idx = score * scale - packed
-    # But we don't have score after sorting...
-    # Use: idx = round(packed % scale) but Triton doesn't have modulo
-    # Use: idx = round(packed - floor(packed / scale) * scale)
-    # Actually simpler: the fractional info IS the index
-    # idx = round(-packed + round(packed)) -- no, that loses info
-    # Let's use: idx = round(score * scale - packed) but we don't have score
-    #
-    # Alternative: store idx separately and use sort to get permutation
-    # Actually, we can recover: idx = round(-frac_part * scale)
-    # Where frac_part = packed - trunc(packed) for the small perturbation
-    #
-    # Simpler approach: after sorting packed values,
-    # idx = round(-packed + (packed // 1)) -- but Triton integer div
-    #
-    # Best: use round(-packed) and subtract round(-packed/scale)*scale
-    # idx = round(-packed + round(-packed / scale) * scale)
-    #
-    # Actually simplest: since packed = score*scale - idx,
-    # idx = round(-packed mod scale)
-    # = round(-packed - floor(-packed/scale)*scale)
     neg = -packed
     quotient = tl.floor(neg / scale)
     return tl.round(neg - quotient * scale).to(tl.int32)
