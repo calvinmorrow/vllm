@@ -68,7 +68,12 @@ th:not(:first-child) {
   are not yet supported on ROCm.
 - *AutoRound (INC) on AMD GPU supports dense symmetric W4A16 and W8A16
   (`auto_round:auto_gptq`) through Triton/RDNA W4A16 kernels.
-  `auto_round:auto_awq`, asymmetric, MoE, INT2/INT3, and `desc_act=true`
+  AutoRound MoE models are also supported on ROCm through the Triton
+  WNA16 MoE backend for symmetric W4A16 GPTQ-format checkpoints
+  (`auto_round:auto_gptq`, `bits=4`, `sym=true`, `group_size=128`, no
+  activation ordering, no expert bias, TP=1). The initial validated
+  model is `Intel/DeepSeek-V4-Flash-W4A16-AutoRound`.
+  `auto_round:auto_awq`, asymmetric, INT2/INT3, and `desc_act=true`
   are not yet supported on ROCm.
 - All Intel Gaudi quantization support has been migrated to [vLLM-Gaudi](https://github.com/vllm-project/vllm-gaudi).
 - *Turing does not support Marlin MXFP4.

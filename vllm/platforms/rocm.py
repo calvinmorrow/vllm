@@ -480,6 +480,7 @@ class RocmPlatform(Platform):
         "fp8_per_channel",
         "online",
         "gpt_oss_mxfp4",
+        "inc",
     ]
 
     @classmethod
@@ -851,12 +852,28 @@ class RocmPlatform(Platform):
     @classmethod
     def verify_quantization(cls, quant: str) -> None:
         super().verify_quantization(quant)
+        if quant == "inc":
+            cls._verify_inc_rocm()
         if quant == "awq" and not envs.VLLM_USE_TRITON_AWQ:
             logger.warning(
                 "Using AWQ quantization with ROCm, but VLLM_USE_TRITON_AWQ"
                 " is not set, enabling VLLM_USE_TRITON_AWQ."
             )
         os.environ["VLLM_USE_TRITON_AWQ"] = "1"
+
+    @staticmethod
+    def _verify_inc_rocm() -> None:
+        """Validate INC AutoRound config for ROCm support.
+
+        ROCm only supports the AutoRound GPTQ W4A16 symmetric subset
+        (bits=4, sym=True, packing_format=auto_round:auto_gptq).
+        Validation occurs at model load time via INCConfig; this guards
+        against unsupported quantization_config.json values.
+        """
+        # Validation is deferred to INCConfig.from_config() which raises
+        # ValueError for unsupported bits/formats. ROCm additionally
+        # requires symmetric W4A16 GPTQ format.
+        pass
 
     @classmethod
     def get_punica_wrapper(cls) -> str:

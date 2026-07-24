@@ -1075,3 +1075,252 @@ def test_auto_gptq_linear_method_no_marlin_check_at_init() -> None:
     method = AutoGPTQLinearMethod(cfg)
     assert method.quant_type == cfg.quant_type
     assert method.quant_config is cfg
+
+
+# ---------------------------------------------------------------------------
+# ROCm-specific AutoRound MoE tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_gptq_moe_rocm_selects_moe_wna16(monkeypatch) -> None:
+    """On ROCm, _resolve_gptq_moe skips Marlin and selects MoeWNA16Method."""
+    captured = {}
+
+    class DummyMoeConfig:
+        pass
+
+    class DummyLayer:
+        moe_config = DummyMoeConfig()
+
+    class DummyBuiltConfig:
+        pass
+
+    built_config = DummyBuiltConfig()
+
+    class DummyMethod:
+        def __init__(self, cfg, moe):
+            captured["cfg"] = cfg
+            captured["moe"] = moe
+
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Config.from_config",
+        lambda cfg: captured.update({"from_config": cfg}) or built_config,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Method",
+        DummyMethod,
+    )
+
+    layer_config = INCLayerConfig(
+        bits=4,
+        group_size=128,
+        sym=True,
+        packing_format="auto_round:auto_gptq",
+        backend="auto",
+        data_type="int",
+        quantized=True,
+    )
+
+    _resolve_gptq_moe(DummyLayer(), layer_config)
+
+    assert captured["from_config"] == {
+        "quant_method": "gptq",
+        "bits": 4,
+        "group_size": 128,
+        "sym": True,
+        "lm_head": False,
+    }
+    assert captured["cfg"] is built_config
+    assert captured["moe"] is DummyLayer.moe_config
+
+
+def test_resolve_gptq_moe_cuda_falls_back_to_moe_wna16_when_marlin_unavailable(
+    monkeypatch,
+) -> None:
+    """On non-ROCm, _resolve_gptq_moe falls back to MoeWNA16Method
+    when Marlin is unavailable."""
+    captured = {}
+
+    class DummyMoeConfig:
+        pass
+
+    class DummyLayer:
+        moe_config = DummyMoeConfig()
+
+    class DummyBuiltConfig:
+        pass
+
+    built_config = DummyBuiltConfig()
+
+    class DummyMethod:
+        def __init__(self, cfg, moe):
+            captured["cfg"] = cfg
+            captured["moe"] = moe
+
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.utils.marlin_utils."
+        "check_marlin_supported",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Config.from_config",
+        lambda cfg: captured.update({"from_config": cfg}) or built_config,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Method",
+        DummyMethod,
+    )
+
+    layer_config = INCLayerConfig(
+        bits=4,
+        group_size=128,
+        sym=True,
+        packing_format="auto_round:auto_gptq",
+        backend="auto",
+        data_type="int",
+        quantized=True,
+    )
+
+    _resolve_gptq_moe(DummyLayer(), layer_config)
+
+    assert captured["from_config"] == {
+        "quant_method": "gptq",
+        "bits": 4,
+        "group_size": 128,
+        "sym": True,
+        "lm_head": False,
+    }
+
+
+def test_rocm_moe_rejects_auto_awq_format(monkeypatch) -> None:
+    """AutoRound AWQ format MoE falls back to MoeWNA16Method
+    when Marlin AWQ is unavailable."""
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.utils.marlin_utils."
+        "check_marlin_supported",
+        lambda *args, **kwargs: False,
+    )
+
+    class DummyMoeConfig:
+        pass
+
+    class DummyLayer:
+        moe_config = DummyMoeConfig()
+
+    captured = {}
+
+    class DummyMoeWNA16Config:
+        @classmethod
+        def from_config(cls, cfg):
+            captured["raw_config"] = cfg
+            return cls()
+
+    class DummyMoeWNA16Method:
+        def __init__(self, cfg, moe):
+            captured["cfg"] = cfg
+            captured["moe"] = moe
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Config",
+        DummyMoeWNA16Config,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Method",
+        DummyMoeWNA16Method,
+    )
+
+    layer_config = INCLayerConfig(
+        bits=4,
+        group_size=128,
+        sym=False,
+        packing_format="auto_round:auto_awq",
+        backend="auto",
+        data_type="int",
+        quantized=True,
+    )
+
+    result = _resolve_awq_moe(DummyLayer(), layer_config)
+
+    assert isinstance(result, DummyMoeWNA16Method)
+    assert captured["raw_config"]["quant_method"] == "awq"
+    assert captured["raw_config"]["zero_point"] is True
+
+
+def test_rocm_moe_non_symmetric_selects_moe_wna16(monkeypatch) -> None:
+    """Non-symmetric GPTQ AutoRound on ROCm creates MoeWNA16Method
+    with has_zp=True."""
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+
+    class DummyMoeConfig:
+        pass
+
+    class DummyLayer:
+        moe_config = DummyMoeConfig()
+
+    captured = {}
+
+    class DummyMoeWNA16Method:
+        def __init__(self, cfg, moe):
+            captured["cfg"] = cfg
+            captured["moe"] = moe
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Method",
+        DummyMoeWNA16Method,
+    )
+
+    layer_config = INCLayerConfig(
+        bits=4,
+        group_size=128,
+        sym=False,
+        packing_format="auto_round:auto_gptq",
+        backend="auto",
+        data_type="int",
+        quantized=True,
+    )
+
+    result = _resolve_gptq_moe(DummyLayer(), layer_config)
+
+    assert isinstance(result, DummyMoeWNA16Method)
+    assert captured["cfg"].has_zp is True
+    assert captured["cfg"].weight_bits == 4
+
+
+def test_rocm_wna16_scheme_get_moe_method(monkeypatch) -> None:
+    """INCWna16Scheme.get_moe_method on ROCm returns MoeWNA16Method
+    for GPTQ-format AutoRound."""
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+
+    class DummyMoeConfig:
+        pass
+
+    class DummyLayer:
+        moe_config = DummyMoeConfig()
+
+    captured = {}
+
+    class DummyMoeWNA16Method:
+        def __init__(self, cfg, moe):
+            captured["cfg"] = cfg
+            captured["moe"] = moe
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Method",
+        DummyMoeWNA16Method,
+    )
+
+    scheme = INCWna16Scheme()
+    layer_config = make_layer_config()
+    config = make_config()
+
+    result = scheme.get_moe_method(config, DummyLayer(), "layer", layer_config)
+
+    assert isinstance(result, DummyMoeWNA16Method)
+    assert captured["cfg"].weight_bits == 4
+    assert captured["cfg"].group_size == 128
+    assert captured["cfg"].has_zp is False

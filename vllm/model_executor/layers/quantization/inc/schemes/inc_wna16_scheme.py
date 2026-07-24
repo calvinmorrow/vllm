@@ -124,6 +124,20 @@ def _resolve_gptq_moe(layer: "torch.nn.Module", layer_config: "INCLayerConfig"):
         check_moe_marlin_supports_layer,
     )
 
+    # On ROCm, Marlin MoE kernels are not available; use MoeWNA16Method
+    # which routes to TritonWNA16Experts via the WNA16 oracle.
+    if current_platform.is_rocm():
+        moe_config = MoeWNA16Config.from_config(
+            {
+                "quant_method": "gptq",
+                "bits": layer_config.bits,
+                "group_size": layer_config.group_size,
+                "sym": layer_config.sym,
+                "lm_head": False,
+            }
+        )
+        return MoeWNA16Method(moe_config, layer.moe_config)
+
     gptq_type_map = {
         (4, True): scalar_types.uint4b8,
         (8, True): scalar_types.uint8b128,

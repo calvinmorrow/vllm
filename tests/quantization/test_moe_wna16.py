@@ -196,3 +196,121 @@ def test_moe_wna16_uses_humming_quant_config(monkeypatch):
     )
 
     assert method.get_fused_moe_quant_config(layer) is quant_config
+
+
+def test_wna16_oracle_rocm_selects_triton(monkeypatch):
+    """On ROCm, MoeWNA16Config with sym=True should select TRITON backend
+    since Marlin backends reject MoeWNA16Config and TRITON accepts it."""
+    # Test that the oracle correctly rejects MARLIN/BATCHED_MARLIN/EMULATION
+    # for MoeWNA16Config (verified by existing test_wna16_oracle_rejects_incompatible)
+    # and that TRITON does not reject MoeWNA16Config with sym=True, no bias
+    reason = _backend_incompatibility_reason(
+        backend=WNA16MoEBackend.TRITON,
+        quant_config=MoeWNA16Config(
+            linear_quant_method="gptq",
+            weight_bits=4,
+            group_size=128,
+            has_zp=False,
+            lm_head_quantized=False,
+            modules_to_not_convert=None,
+            full_config={},
+        ),
+        may_have_zp=False,
+        may_have_bias=False,
+    )
+
+    # TRITON should accept symmetric GPTQ MoeWNA16Config with no bias
+    assert reason is None
+
+
+def test_wna16_oracle_rejects_marlin_for_moe_wna16_config():
+    """MARLIN backends reject MoeWNA16Config due to checkpoint layout."""
+    reason = _backend_incompatibility_reason(
+        backend=WNA16MoEBackend.MARLIN,
+        quant_config=MoeWNA16Config(
+            linear_quant_method="gptq",
+            weight_bits=4,
+            group_size=128,
+            has_zp=False,
+            lm_head_quantized=False,
+            modules_to_not_convert=None,
+            full_config={},
+        ),
+        may_have_zp=False,
+        may_have_bias=False,
+    )
+
+    assert reason is not None
+    assert "MoeWNA16 checkpoint layout" in reason
+
+
+def test_wna16_oracle_rejects_triton_for_expert_bias():
+    """TRITON backend should reject configs with expert bias."""
+    reason = _backend_incompatibility_reason(
+        backend=WNA16MoEBackend.TRITON,
+        quant_config=MoeWNA16Config(
+            linear_quant_method="gptq",
+            weight_bits=4,
+            group_size=128,
+            has_zp=False,
+            lm_head_quantized=False,
+            modules_to_not_convert=None,
+            full_config={},
+        ),
+        may_have_zp=False,
+        may_have_bias=True,
+    )
+
+    assert reason is not None
+    assert "bias" in reason
+
+
+def test_convert_to_wna16_moe_wna16_nfirst_uint8_for_triton():
+    """For MoeWNA16Config, convert_to_wna16_moe_kernel_format treats
+    TRITON input as N-first uint8 (already in correct layout), doing a
+    no-op view to uint8."""
+    quant_config = MoeWNA16Config(
+        linear_quant_method="gptq",
+        weight_bits=4,
+        group_size=128,
+        has_zp=False,
+        lm_head_quantized=False,
+        modules_to_not_convert=None,
+        full_config={},
+    )
+
+    # MoeWNA16 uses N-first uint8 layout:
+    # w13: (num_experts, 2*intermediate, hidden // bit8_pack)
+    # w2: (num_experts, hidden, intermediate // bit8_pack)
+    num_experts, intermediate, hidden, bit8_pack = 2, 8, 16, 8
+    w13 = torch.arange(
+        num_experts * 2 * intermediate * (hidden // bit8_pack),
+        dtype=torch.uint8,
+    ).reshape(num_experts, 2 * intermediate, hidden // bit8_pack)
+    w2 = torch.arange(
+        num_experts * hidden * (intermediate // bit8_pack),
+        dtype=torch.uint8,
+    ).reshape(num_experts, hidden, intermediate // bit8_pack)
+    w13_scale = torch.ones(num_experts, 2 * intermediate, 1, dtype=torch.float16)
+    w2_scale = torch.ones(num_experts, hidden, 1, dtype=torch.float16)
+
+    layer = torch.nn.Module()
+
+    converted = convert_to_wna16_moe_kernel_format(
+        backend=WNA16MoEBackend.TRITON,
+        layer=layer,
+        quant_config=quant_config,
+        input_dtype=torch.bfloat16,
+        w13=w13,
+        w2=w2,
+        w13_scale=w13_scale,
+        w2_scale=w2_scale,
+    )
+
+    assert converted is not None
+    # MoeWNA16 N-first uint8 → no transpose, just view
+    assert converted[0].shape == w13.shape
+    assert converted[1].shape == w2.shape
+    assert converted[0].dtype == torch.uint8
+    assert torch.equal(converted[0], w13)
+    assert torch.equal(converted[1], w2)

@@ -104,8 +104,27 @@ inference on AMD ROCm GPUs through Triton/RDNA W4A16 kernels.
 - Asymmetric quantization (`sym=false`)
 - INT2 / INT3 / INT8 weight-only quantization
 - Activation reordering (`desc_act=true`)
-- MoE (Mixture of Experts) AutoRound models
 - Forced `backend="marlin"` (Marlin is NVIDIA-only; use `backend="auto"`)
+
+### MoE (Mixture of Experts) on ROCm
+
+vLLM supports AutoRound MoE models on ROCm through the Triton WNA16 MoE
+backend. The following MoE configuration is supported:
+
+- **Packing format**: `auto_round:auto_gptq` only
+- **W4A16**: 4-bit symmetric INT4 (`bits=4`, `sym=true`, `group_size=128`)
+- **No activation ordering**: `desc_act` must be absent or `false`
+- **No expert bias**: expert layers must not use bias terms
+- **TP=1**: tensor parallelism > 1 requires additional validation
+- **Initial validated model**: `Intel/DeepSeek-V4-Flash-W4A16-AutoRound`
+
+#### Example: ROCm MoE inference
+
+```bash
+vllm serve Intel/DeepSeek-V4-Flash-W4A16-AutoRound \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 4096
+```
 
 ### Example: ROCm inference
 
