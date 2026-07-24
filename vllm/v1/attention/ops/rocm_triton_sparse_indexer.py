@@ -22,6 +22,11 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx1151 as _on_gfx1151
+else:
+    _on_gfx1151 = lambda: False  # type: ignore[assignment]
+
 
 def is_gfx1151_triton_sparse_indexer_available() -> bool:
     """Return True when the gfx1151 Triton sparse-indexer path is available.
@@ -29,9 +34,7 @@ def is_gfx1151_triton_sparse_indexer_available() -> bool:
     Narrow, operation-specific capability check. Does not affect AITER
     eligibility or broad ROCm capability gates.
     """
-    if not current_platform.is_rocm():
-        return False
-    return current_platform.on_gfx1151()
+    return _on_gfx1151()
 
 
 @eager_break_during_capture
