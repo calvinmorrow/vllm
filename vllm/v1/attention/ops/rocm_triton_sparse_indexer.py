@@ -240,7 +240,7 @@ def rocm_triton_sparse_attn_indexer(
 
 def _rocm_triton_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
-    k_cache_prefix: LayerNameType,
+    k_cache_prefix: LayerNameType,  # type: ignore[assignment]
     kv_cache: torch.Tensor,
     q_fp8: torch.Tensor,
     k: torch.Tensor,
