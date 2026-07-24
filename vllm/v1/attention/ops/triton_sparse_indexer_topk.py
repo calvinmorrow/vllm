@@ -101,11 +101,11 @@ def _topk_sort_kernel(
     # Unpack indices
     idxs_sorted = _unpack_idx(packed_sorted, SCORE_SCALE)
 
-    # Write top-k
+    # top_offsets is sequential [0..SORT_N), so just store idxs_sorted directly
     top_offsets = tl.arange(0, SORT_N)
     tl.store(
         selected_ptr + row * stride_selected + top_offsets,
-        idxs_sorted[top_offsets],
+        idxs_sorted,
         mask=top_offsets < top_k,
     )
 
@@ -147,7 +147,7 @@ def _topk_chunk_kernel(
     top_offsets = tl.arange(0, SORT_N)
     tl.store(
         out_ptr + top_offsets,
-        idxs_sorted[top_offsets],
+        idxs_sorted,
         mask=top_offsets < top_k,
     )
 
@@ -192,7 +192,7 @@ def _topk_merge_kernel(
     top_offsets = tl.arange(0, SORT_N)
     tl.store(
         out_ptr + row * top_k + top_offsets,
-        idxs_sorted[top_offsets],
+        idxs_sorted,
         mask=top_offsets < top_k,
     )
 
@@ -249,7 +249,7 @@ def _topk_tree_merge_kernel(
     top_offsets = tl.arange(0, SORT_N)
     tl.store(
         out_ptr + out_base + top_offsets,
-        idxs_sorted[top_offsets],
+        idxs_sorted,
         mask=top_offsets < top_k,
     )
 
