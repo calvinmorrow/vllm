@@ -232,3 +232,38 @@ def rocm_triton_sparse_attn_indexer(
             )
 
     return topk_indices_buffer
+
+
+# ---------------------------------------------------------------------------
+# Torch custom op registration for proper cudagraph handling
+# ---------------------------------------------------------------------------
+
+def _rocm_triton_sparse_attn_indexer_fake(
+    hidden_states: torch.Tensor,
+    k_cache_prefix: LayerNameType,
+    kv_cache: torch.Tensor,
+    q_fp8: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: str | None,
+    topk_tokens: int,
+    head_dim: int,
+    max_model_len: int,
+    total_seq_lens: int,
+    topk_indices_buffer: torch.Tensor | None,
+    skip_k_cache_insert: bool = False,
+) -> torch.Tensor:
+    return topk_indices_buffer
+
+
+if _on_gfx1151():
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    direct_register_custom_op(
+        op_name="rocm_triton_sparse_attn_indexer",
+        op_func=rocm_triton_sparse_attn_indexer,
+        mutates_args=["topk_indices_buffer"],
+        fake_impl=_rocm_triton_sparse_attn_indexer_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )

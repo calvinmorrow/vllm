@@ -35,6 +35,9 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.rocm_triton_sparse_indexer import (
+    is_gfx1151_triton_sparse_indexer_available,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -844,13 +847,8 @@ class SparseAttnIndexer(CustomOp):
                 skip_k_cache_insert=self.skip_k_cache_insert,
             )
         # gfx1151 Triton path: native top-k without AITER
-        from vllm.v1.attention.ops.rocm_triton_sparse_indexer import (
-            is_gfx1151_triton_sparse_indexer_available,
-            rocm_triton_sparse_attn_indexer,
-        )
-
         if is_gfx1151_triton_sparse_indexer_available():
-            return rocm_triton_sparse_attn_indexer(
+            return torch.ops.vllm.rocm_triton_sparse_attn_indexer(
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),
                 self.k_cache.kv_cache,
