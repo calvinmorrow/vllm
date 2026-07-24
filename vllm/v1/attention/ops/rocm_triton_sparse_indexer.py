@@ -23,8 +23,18 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_rocm():
-    from vllm.platforms.rocm import on_gfx1151 as _on_gfx1151
+    from vllm.platforms.rocm import (
+        on_gfx942 as _on_gfx942,
+    )
+    from vllm.platforms.rocm import (
+        on_gfx950 as _on_gfx950,
+    )
+    from vllm.platforms.rocm import (
+        on_gfx1151 as _on_gfx1151,
+    )
 else:
+    _on_gfx942 = lambda: False  # type: ignore[assignment]
+    _on_gfx950 = lambda: False  # type: ignore[assignment]
     _on_gfx1151 = lambda: False  # type: ignore[assignment]
 
 
@@ -84,7 +94,7 @@ def rocm_triton_sparse_attn_indexer(
             ((total_seq_lens, head_dim), fp8_dtype),
             ((total_seq_lens, 4), torch.uint8),
         )
-        if current_platform.on_gfx942() or current_platform.on_gfx950():
+        if _on_gfx942() or _on_gfx950():
             workspace_manager.get_simultaneous(
                 ((hidden_states.shape[0], max_model_len), torch.float32),
             )
