@@ -55,9 +55,15 @@ def _pack_score_idx(score, idx, scale: tl.constexpr):
 @triton.jit
 def _unpack_idx(packed, scale: tl.constexpr):
     """Extract index from packed float64 value."""
+    # packed = score * scale - idx
+    # neg = -packed = -score * scale + idx
+    # floor(neg / scale) = -score (since idx < scale)
+    # idx = neg - floor(neg / scale) * scale
+    # round to handle floating point imprecision: floor(x + 0.5)
     neg = -packed
     quotient = tl.floor(neg / scale)
-    return tl.round(neg - quotient * scale).to(tl.int32)
+    remainder = neg - quotient * scale
+    return tl.floor(remainder + 0.5).to(tl.int32)
 
 
 # ---------------------------------------------------------------------------
