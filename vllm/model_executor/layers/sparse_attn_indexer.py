@@ -843,7 +843,32 @@ class SparseAttnIndexer(CustomOp):
                 self.topk_indices_buffer,
                 skip_k_cache_insert=self.skip_k_cache_insert,
             )
+        # gfx1151 Triton path: native top-k without AITER
+        from vllm.v1.attention.ops.rocm_triton_sparse_indexer import (
+            is_gfx1151_triton_sparse_indexer_available,
+            rocm_triton_sparse_attn_indexer,
+        )
+
+        if is_gfx1151_triton_sparse_indexer_available():
+            return rocm_triton_sparse_attn_indexer(
+                hidden_states,
+                _encode_layer_name(self.k_cache.prefix),
+                self.k_cache.kv_cache,
+                q_quant,
+                k,
+                weights,
+                self.quant_block_size,
+                self.scale_fmt,
+                self.topk_tokens,
+                self.head_dim,
+                self.max_model_len,
+                self.max_total_seq_len,
+                self.topk_indices_buffer,
+                skip_k_cache_insert=self.skip_k_cache_insert,
+            )
         raise RuntimeError(
-            "Sparse attention indexer ROCm path is only supported on AITER. "
-            "Please enable aiter with VLLM_ROCM_USE_AITER=1"
+            "Sparse attention indexer ROCm path requires AITER (MI300+) "
+            "or a verified gfx1151 device with Triton support. "
+            "For MI300+: set VLLM_ROCM_USE_AITER=1. "
+            "For gfx1151: ensure ROCm detects the correct architecture."
         )
