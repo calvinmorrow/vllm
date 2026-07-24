@@ -108,6 +108,7 @@ def _topk_sort_kernel(
     stride_scores,
     stride_selected,
     SORT_N: tl.constexpr,
+    SCORE_SCALE: tl.constexpr,
 ):
     """Sort-based top-k: one program per row."""
     row = tl.program_id(0)
@@ -120,14 +121,13 @@ def _topk_sort_kernel(
     idxs = tl.where(mask, offsets, -1)
 
     # Pack score+index into float64 for sorting
-    # Higher score + lower index = higher packed value
-    packed = _pack_score_idx(vals, idxs, _SCORE_SCALE)
+    packed = _pack_score_idx(vals, idxs, SCORE_SCALE)
 
     # Sort descending
     packed_sorted = tl.sort(packed, descending=True)
 
     # Unpack indices
-    idxs_sorted = _unpack_idx(packed_sorted, _SCORE_SCALE)
+    idxs_sorted = _unpack_idx(packed_sorted, SCORE_SCALE)
 
     # Write top-k
     top_offsets = tl.arange(0, top_k)
@@ -148,6 +148,7 @@ def _topk_chunk_kernel(
     stride_scores,
     SORT_N: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
+    SCORE_SCALE: tl.constexpr,
 ):
     """Chunk-local top-k for chunk-and-merge pipeline."""
     row = tl.program_id(0)
@@ -166,9 +167,9 @@ def _topk_chunk_kernel(
     vals = tl.where(mask, tl.load(scores_ptr + scores_off), -float("inf"))
     idxs = tl.where(mask, abs_offsets, -1)
 
-    packed = _pack_score_idx(vals, idxs, _SCORE_SCALE)
+    packed = _pack_score_idx(vals, idxs, SCORE_SCALE)
     packed_sorted = tl.sort(packed, descending=True)
-    idxs_sorted = _unpack_idx(packed_sorted, _SCORE_SCALE)
+    idxs_sorted = _unpack_idx(packed_sorted, SCORE_SCALE)
 
     out_ptr = candidates_ptr + row * candidate_stride + chunk * top_k
     top_offsets = tl.arange(0, top_k)
@@ -189,6 +190,7 @@ def _topk_merge_kernel(
     candidate_count,
     stride_scores,
     SORT_N: tl.constexpr,
+    SCORE_SCALE: tl.constexpr,
 ):
     """Merge sorted candidate sets into top-k."""
     row = tl.program_id(0)
@@ -211,9 +213,9 @@ def _topk_merge_kernel(
         -float("inf"),
     )
 
-    packed = _pack_score_idx(vals, c_idx, _SCORE_SCALE)
+    packed = _pack_score_idx(vals, c_idx, SCORE_SCALE)
     packed_sorted = tl.sort(packed, descending=True)
-    idxs_sorted = _unpack_idx(packed_sorted, _SCORE_SCALE)
+    idxs_sorted = _unpack_idx(packed_sorted, SCORE_SCALE)
 
     top_offsets = tl.arange(0, top_k)
     tl.store(
@@ -237,6 +239,7 @@ def _topk_tree_merge_kernel(
     next_stride,
     stride_scores,
     SORT_N: tl.constexpr,
+    SCORE_SCALE: tl.constexpr,
 ):
     """Tree merge: merge one group of candidate sets."""
     row = tl.program_id(0)
@@ -266,9 +269,9 @@ def _topk_tree_merge_kernel(
         -float("inf"),
     )
 
-    packed = _pack_score_idx(vals, c_idx, _SCORE_SCALE)
+    packed = _pack_score_idx(vals, c_idx, SCORE_SCALE)
     packed_sorted = tl.sort(packed, descending=True)
-    idxs_sorted = _unpack_idx(packed_sorted, _SCORE_SCALE)
+    idxs_sorted = _unpack_idx(packed_sorted, SCORE_SCALE)
 
     out_base = row * next_stride + group * top_k
     top_offsets = tl.arange(0, top_k)
@@ -315,6 +318,7 @@ def _topk_single_phase(
         scores.stride(0),
         selected.stride(0),
         SORT_N=sort_n,
+        SCORE_SCALE=_SCORE_SCALE,
         num_warps=4,
     )
     return selected
@@ -359,6 +363,7 @@ def _topk_chunk_and_merge(
         scores.stride(0),
         SORT_N=sort_n,
         CHUNK_SIZE=CHUNK_N,
+        SCORE_SCALE=_SCORE_SCALE,
         num_warps=4,
     )
 
@@ -386,6 +391,7 @@ def _topk_chunk_and_merge(
             next_stride,
             scores.stride(0),
             SORT_N=sort_n,
+            SCORE_SCALE=_SCORE_SCALE,
             num_warps=4,
         )
 
@@ -411,6 +417,7 @@ def _topk_chunk_and_merge(
         final_candidate_count,
         scores.stride(0),
         SORT_N=sort_n,
+        SCORE_SCALE=_SCORE_SCALE,
         num_warps=4,
     )
 
