@@ -926,6 +926,9 @@ class RocmPlatform(Platform):
     def is_navi(cls) -> bool:
         return "gfx1" in _GCN_ARCH
 
+    def on_gfx1151(self) -> bool:
+        return on_gfx1151()
+
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:
         return "vllm.compilation.cuda_graph.CUDAGraphWrapper"

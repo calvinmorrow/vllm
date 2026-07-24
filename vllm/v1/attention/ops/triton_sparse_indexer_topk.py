@@ -27,6 +27,11 @@ SORT_N_MAX: Final = 8192
 # Supported SORT_N values (powers of 2).
 _SUPPORTED_SORT_N = (256, 512, 1024, 2048, 4096, 8192)
 
+# Scale factor for packing score+index into float64
+# Score range is typically [-10, 10], index range is [0, 8191]
+# With SCALE = 1e6, score*SCALE dominates and -index breaks ties
+_SCORE_SCALE: Final = 1e6
+
 
 def _select_sort_n(n: int) -> int:
     """Select SORT_N from supported values for given n."""
@@ -42,57 +47,55 @@ def _select_sort_n(n: int) -> int:
 
 
 @triton.jit
-def _bitonic_sort_step(
-    vals,
-    idxs,
-    k: tl.constexpr,
-    j: tl.constexpr,
-    sort_n: tl.constexpr,
-    block_size: tl.constexpr,
-):
-    """One bitonic merge step with grid-stride loop."""
-    tid = tl.program_id(1) if block_size > 1 else 0
-    n_threads = tl.num_programs(1) if block_size > 1 else 1
+def _pack_score_idx(
+    score: tl.tensor,
+    idx: tl.tensor,
+    scale: tl.constexpr,
+) -> tl.tensor:
+    """Pack score and index into float64 for sorting.
 
-    for i in range(tid, sort_n, n_threads):
-        other = i ^ j
-        if other > i and other < sort_n:
-            av = vals[i]
-            bv = vals[other]
-            ai = idxs[i]
-            bi = idxs[other]
-
-            desc_half = (i & k) == 0
-            # better: higher score, or equal score with lower index
-            swap_desc = (bv > av) | ((bv == av) & (bi < ai))
-            swap_asc = (av > bv) | ((av == bv) & (ai < bi))
-            swap = swap_desc if desc_half else swap_asc
-
-            vals[i] = bv if swap else av
-            vals[other] = av if swap else bv
-            idxs[i] = bi if swap else ai
-            idxs[other] = ai if swap else bi
-
-    tl.debug_barrier()
+    Higher score -> higher packed value.
+    Equal scores: lower index -> higher packed value (for tie-breaking).
+    """
+    # packed = score * scale - index
+    # Sorting descending: higher score first, then lower index first
+    return score.to(tl.float64) * scale - idx.to(tl.float64)
 
 
 @triton.jit
-def _bitonic_sort(
-    vals,
-    idxs,
-    sort_n: tl.constexpr,
-    block_size: tl.constexpr,
-):
-    """Full bitonic sort: descending score, ascending index for ties."""
-    # k = 2, 4, 8, ..., sort_n
-    for _k in range(sort_n >> 1, 0, -1):
-        # j goes from _k down to 1
-        for j in range(_k, 0, -1):
-            _bitonic_sort_step(vals, idxs, _k * 2, j, sort_n, block_size)
+def _unpack_idx(packed: tl.tensor, scale: tl.constexpr) -> tl.tensor:
+    """Extract index from packed float64 value."""
+    # idx = round(scale - packed) when score ~ 0
+    # More robust: idx = round(-fract(packed / 1) * scale)
+    # Actually: packed = score * scale - idx
+    # So: idx = score * scale - packed
+    # But we don't have score after sorting...
+    # Use: idx = round(packed % scale) but Triton doesn't have modulo
+    # Use: idx = round(packed - floor(packed / scale) * scale)
+    # Actually simpler: the fractional info IS the index
+    # idx = round(-packed + round(packed)) -- no, that loses info
+    # Let's use: idx = round(score * scale - packed) but we don't have score
+    #
+    # Alternative: store idx separately and use sort to get permutation
+    # Actually, we can recover: idx = round(-frac_part * scale)
+    # Where frac_part = packed - trunc(packed) for the small perturbation
+    #
+    # Simpler approach: after sorting packed values,
+    # idx = round(-packed + (packed // 1)) -- but Triton integer div
+    #
+    # Best: use round(-packed) and subtract round(-packed/scale)*scale
+    # idx = round(-packed + round(-packed / scale) * scale)
+    #
+    # Actually simplest: since packed = score*scale - idx,
+    # idx = round(-packed mod scale)
+    # = round(-packed - floor(-packed/scale)*scale)
+    neg = -packed
+    quotient = tl.floor(neg / scale)
+    return tl.round(neg - quotient * scale).to(tl.int32)
 
 
 # ---------------------------------------------------------------------------
-# Per-SORT_N kernels
+# Per-SORT_N kernels using tl.sort with packing
 # ---------------------------------------------------------------------------
 
 
@@ -105,33 +108,34 @@ def _topk_sort_kernel(
     stride_scores,
     stride_selected,
     SORT_N: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
 ):
-    """Sort-based top-k: one block per row, grid-stride threads."""
+    """Sort-based top-k: one program per row."""
     row = tl.program_id(0)
 
-    vals = tl.zeros([SORT_N], dtype=tl.float32)
-    idxs = tl.zeros([SORT_N], dtype=tl.int32)
+    # Load scores + create indices
+    offsets = tl.arange(0, SORT_N)
+    mask = offsets < n_comp
+    scores_off = row * stride_scores + offsets
+    vals = tl.where(mask, tl.load(scores_ptr + scores_off), -float("inf"))
+    idxs = tl.where(mask, offsets, tl.full_like(offsets, -1))
 
-    tid = tl.program_id(1)
-    n_threads = tl.num_programs(1)
+    # Pack score+index into float64 for sorting
+    # Higher score + lower index = higher packed value
+    packed = _pack_score_idx(vals, idxs, _SCORE_SCALE)
 
-    # Load scores + indices (grid-stride)
-    for i in range(tid, SORT_N, n_threads):
-        if i < n_comp:
-            vals[i] = tl.load(scores_ptr + row * stride_scores + i)
-            idxs[i] = i
-        else:
-            vals[i] = -float("inf")
-            idxs[i] = -1
-    tl.debug_barrier()
+    # Sort descending
+    packed_sorted = tl.sort(packed, descending=True)
 
-    # Bitonic sort
-    _bitonic_sort(vals, idxs, SORT_N, BLOCK_SIZE)
+    # Unpack indices
+    idxs_sorted = _unpack_idx(packed_sorted, _SCORE_SCALE)
 
-    # Write top-k (grid-stride)
-    for i in range(tid, top_k, n_threads):
-        tl.store(selected_ptr + row * stride_selected + i, idxs[i])
+    # Write top-k
+    top_offsets = tl.arange(0, top_k)
+    tl.store(
+        selected_ptr + row * stride_selected + top_offsets,
+        idxs_sorted[top_offsets],
+        mask=top_offsets < top_k,
+    )
 
 
 @triton.jit
@@ -143,39 +147,36 @@ def _topk_chunk_kernel(
     candidate_stride,
     stride_scores,
     SORT_N: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
 ):
     """Chunk-local top-k for chunk-and-merge pipeline."""
     row = tl.program_id(0)
     chunk = tl.program_id(1)
 
-    actual_chunk_start = chunk * CHUNK_N
+    actual_chunk_start = chunk * CHUNK_SIZE
     if actual_chunk_start >= n_comp:
         return
 
-    actual_chunk_n = min(n_comp - actual_chunk_start, CHUNK_N)
+    actual_chunk_n = min(n_comp - actual_chunk_start, CHUNK_SIZE)
 
-    vals = tl.zeros([SORT_N], dtype=tl.float32)
-    idxs = tl.zeros([SORT_N], dtype=tl.int32)
+    offsets = tl.arange(0, SORT_N)
+    abs_offsets = actual_chunk_start + offsets
+    mask = offsets < actual_chunk_n
+    scores_off = row * stride_scores + abs_offsets
+    vals = tl.where(mask, tl.load(scores_ptr + scores_off), -float("inf"))
+    idxs = tl.where(mask, abs_offsets, tl.full_like(abs_offsets, -1))
 
-    tid = tl.program_id(2)
-    n_threads = tl.num_programs(2)
-
-    for i in range(tid, SORT_N, n_threads):
-        abs_idx = actual_chunk_start + i
-        if i < actual_chunk_n:
-            vals[i] = tl.load(scores_ptr + row * stride_scores + abs_idx)
-            idxs[i] = abs_idx
-        else:
-            vals[i] = -float("inf")
-            idxs[i] = -1
-    tl.debug_barrier()
-
-    _bitonic_sort(vals, idxs, SORT_N, BLOCK_SIZE)
+    packed = _pack_score_idx(vals, idxs, _SCORE_SCALE)
+    packed_sorted = tl.sort(packed, descending=True)
+    idxs_sorted = _unpack_idx(packed_sorted, _SCORE_SCALE)
 
     out_ptr = candidates_ptr + row * candidate_stride + chunk * top_k
-    for i in range(tid, top_k, n_threads):
-        tl.store(out_ptr + i, idxs[i])
+    top_offsets = tl.arange(0, top_k)
+    tl.store(
+        out_ptr + top_offsets,
+        idxs_sorted[top_offsets],
+        mask=top_offsets < top_k,
+    )
 
 
 @triton.jit
@@ -188,35 +189,38 @@ def _topk_merge_kernel(
     candidate_count,
     stride_scores,
     SORT_N: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
 ):
     """Merge sorted candidate sets into top-k."""
     row = tl.program_id(0)
 
-    vals = tl.zeros([SORT_N], dtype=tl.float32)
-    idxs = tl.zeros([SORT_N], dtype=tl.int32)
+    offsets = tl.arange(0, SORT_N)
+    c_mask = offsets < candidate_count
 
-    tid = tl.program_id(1)
-    n_threads = tl.num_programs(1)
+    # Load candidate indices
+    c_idx = tl.where(
+        c_mask,
+        tl.load(candidates_ptr + offsets),
+        -1,
+    )
 
-    for i in range(tid, SORT_N, n_threads):
-        if i < candidate_count:
-            c_idx = tl.load(candidates_ptr + i)
-            if c_idx >= 0 and c_idx < n_comp:
-                vals[i] = tl.load(scores_ptr + row * stride_scores + c_idx)
-                idxs[i] = c_idx
-            else:
-                vals[i] = -float("inf")
-                idxs[i] = -1
-        else:
-            vals[i] = -float("inf")
-            idxs[i] = -1
-    tl.debug_barrier()
+    # Load scores at candidate indices
+    valid = c_idx >= 0 & c_idx < n_comp
+    vals = tl.where(
+        valid,
+        tl.load(scores_ptr + row * stride_scores + c_idx),
+        -float("inf"),
+    )
 
-    _bitonic_sort(vals, idxs, SORT_N, BLOCK_SIZE)
+    packed = _pack_score_idx(vals, c_idx, _SCORE_SCALE)
+    packed_sorted = tl.sort(packed, descending=True)
+    idxs_sorted = _unpack_idx(packed_sorted, _SCORE_SCALE)
 
-    for i in range(tid, top_k, n_threads):
-        tl.store(out_ptr + row * top_k + i, idxs[i])
+    top_offsets = tl.arange(0, top_k)
+    tl.store(
+        out_ptr + row * top_k + top_offsets,
+        idxs_sorted[top_offsets],
+        mask=top_offsets < top_k,
+    )
 
 
 @triton.jit
@@ -233,7 +237,6 @@ def _topk_tree_merge_kernel(
     next_stride,
     stride_scores,
     SORT_N: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
 ):
     """Tree merge: merge one group of candidate sets."""
     row = tl.program_id(0)
@@ -246,34 +249,34 @@ def _topk_tree_merge_kernel(
     actual_set_count = min(merge_group, n_sets - set0)
     actual_candidate_count = actual_set_count * top_k
 
-    vals = tl.zeros([SORT_N], dtype=tl.float32)
-    idxs = tl.zeros([SORT_N], dtype=tl.int32)
-
-    tid = tl.program_id(2)
-    n_threads = tl.num_programs(2)
-
     base = set0 * top_k
-    for i in range(tid, SORT_N, n_threads):
-        if i < actual_candidate_count:
-            c_idx = tl.load(
-                candidates_ptr + row * cur_stride + base + i
-            )
-            if c_idx >= 0 and c_idx < n_comp:
-                vals[i] = tl.load(scores_ptr + row * stride_scores + c_idx)
-                idxs[i] = c_idx
-            else:
-                vals[i] = -float("inf")
-                idxs[i] = -1
-        else:
-            vals[i] = -float("inf")
-            idxs[i] = -1
-    tl.debug_barrier()
+    offsets = tl.arange(0, SORT_N)
+    c_mask = offsets < actual_candidate_count
 
-    _bitonic_sort(vals, idxs, SORT_N, BLOCK_SIZE)
+    c_idx = tl.where(
+        c_mask,
+        tl.load(candidates_ptr + row * cur_stride + base + offsets),
+        -1,
+    )
+
+    valid = c_idx >= 0 & c_idx < n_comp
+    vals = tl.where(
+        valid,
+        tl.load(scores_ptr + row * stride_scores + c_idx),
+        -float("inf"),
+    )
+
+    packed = _pack_score_idx(vals, c_idx, _SCORE_SCALE)
+    packed_sorted = tl.sort(packed, descending=True)
+    idxs_sorted = _unpack_idx(packed_sorted, _SCORE_SCALE)
 
     out_base = row * next_stride + group * top_k
-    for i in range(tid, top_k, n_threads):
-        tl.store(out_ptr + out_base + i, idxs[i])
+    top_offsets = tl.arange(0, top_k)
+    tl.store(
+        out_ptr + out_base + top_offsets,
+        idxs_sorted[top_offsets],
+        mask=top_offsets < top_k,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -286,12 +289,12 @@ def _topk_single_phase(
     top_k: int,
     sort_n: int,
 ) -> torch.Tensor:
-    """Single-phase bitonic sort top-k.
+    """Single-phase sort top-k.
 
     Args:
         scores: [num_tokens, n_comp] fp32 scores.
         top_k: number of top indices to select.
-        sort_n: power-of-2 shared memory size >= n_comp.
+        sort_n: power-of-2 size >= n_comp.
 
     Returns:
         [num_tokens, top_k] int32 indices (descending score, -1 padding).
@@ -299,19 +302,11 @@ def _topk_single_phase(
     num_tokens, n_comp = scores.shape
     assert sort_n >= n_comp, f"sort_n={sort_n} < n_comp={n_comp}"
 
-    # Choose block size (threads per block)
-    block_size = min(1024, sort_n)
-    while sort_n % block_size != 0 and block_size > 64:
-        block_size //= 2
-    while block_size & (block_size - 1) != 0:
-        block_size -= 1
-    block_size = max(64, block_size)
-
     selected = torch.full(
         (num_tokens, top_k), -1, dtype=torch.int32, device=scores.device
     )
 
-    grid = (num_tokens, block_size)
+    grid = (num_tokens,)
     _topk_sort_kernel[grid](
         scores,
         selected,
@@ -320,7 +315,6 @@ def _topk_single_phase(
         scores.stride(0),
         selected.stride(0),
         SORT_N=sort_n,
-        BLOCK_SIZE=block_size,
         num_warps=4,
     )
     return selected
@@ -339,7 +333,6 @@ def _topk_chunk_and_merge(
     num_tokens, n_comp = scores.shape
     n_chunks = math.ceil(n_comp / CHUNK_N)
     sort_n = CHUNK_N
-    block_size = 256
 
     # Scratch allocation
     candidate_stride_phase1 = n_chunks * top_k
@@ -356,7 +349,7 @@ def _topk_chunk_and_merge(
     # Phase 1: chunk-local top-k
     cur_offset = 0
     cur_stride = candidate_stride_phase1
-    grid_chunks = (num_tokens, n_chunks, block_size)
+    grid_chunks = (num_tokens, n_chunks)
     _topk_chunk_kernel[grid_chunks](
         scores,
         scratch,
@@ -365,7 +358,7 @@ def _topk_chunk_and_merge(
         cur_stride,
         scores.stride(0),
         SORT_N=sort_n,
-        BLOCK_SIZE=block_size,
+        CHUNK_SIZE=CHUNK_N,
         num_warps=4,
     )
 
@@ -376,7 +369,7 @@ def _topk_chunk_and_merge(
         next_stride = next_sets * top_k
         next_offset = cur_offset + cur_stride
 
-        grid_merge = (num_tokens, next_sets, block_size)
+        grid_merge = (num_tokens, next_sets)
         cur_ptr = scratch[:, cur_offset : cur_offset + cur_stride]
         next_ptr = scratch[:, next_offset : next_offset + next_stride]
 
@@ -393,7 +386,6 @@ def _topk_chunk_and_merge(
             next_stride,
             scores.stride(0),
             SORT_N=sort_n,
-            BLOCK_SIZE=block_size,
             num_warps=4,
         )
 
@@ -409,7 +401,7 @@ def _topk_chunk_and_merge(
     final_candidate_count = n_sets * top_k
     final_cur_ptr = scratch[:, cur_offset : cur_offset + cur_stride]
 
-    grid_final = (num_tokens, block_size)
+    grid_final = (num_tokens,)
     _topk_merge_kernel[grid_final](
         final_cur_ptr,
         scores,
@@ -419,7 +411,6 @@ def _topk_chunk_and_merge(
         final_candidate_count,
         scores.stride(0),
         SORT_N=sort_n,
-        BLOCK_SIZE=block_size,
         num_warps=4,
     )
 

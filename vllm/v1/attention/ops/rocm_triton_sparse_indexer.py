@@ -17,7 +17,7 @@ import torch
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import LayerNameType, _resolve_layer_name
+from vllm.utils.torch_utils import _resolve_layer_name
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -50,7 +50,7 @@ def is_gfx1151_triton_sparse_indexer_available() -> bool:
 @eager_break_during_capture
 def rocm_triton_sparse_attn_indexer(
     hidden_states: torch.Tensor,
-    k_cache_prefix: LayerNameType,
+    k_cache_prefix: str,
     kv_cache: torch.Tensor,
     q_fp8: torch.Tensor,
     k: torch.Tensor,
@@ -100,9 +100,7 @@ def rocm_triton_sparse_attn_indexer(
         workspace_manager.get_simultaneous(
             ((hidden_states.shape[0], max_model_len), torch.float32),
         )
-        max_logits_elems = (
-            envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-        )
+        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         _ = torch.empty(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
         )
@@ -238,9 +236,10 @@ def rocm_triton_sparse_attn_indexer(
 # Torch custom op registration for proper cudagraph handling
 # ---------------------------------------------------------------------------
 
+
 def _rocm_triton_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
-    k_cache_prefix: LayerNameType,  # type: ignore[assignment]
+    k_cache_prefix: str,
     kv_cache: torch.Tensor,
     q_fp8: torch.Tensor,
     k: torch.Tensor,
