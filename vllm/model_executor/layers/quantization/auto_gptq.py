@@ -47,7 +47,6 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
     marlin_make_workspace_new,
     marlin_repeat_scales_on_all_ranks,
-    verify_marlin_supported,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -304,7 +303,10 @@ class AutoGPTQConfig(QuantizationConfig):
 
 
 class AutoGPTQLinearMethod(LinearMethodBase):
-    """Linear method for AutoGPTQ using Marlin kernels.
+    """Linear method for AutoGPTQ using mixed-precision W4A16 kernels.
+
+    On CUDA, selects Marlin when available; on ROCm, falls through to
+    Triton/RDNA W4A16 kernels via ``choose_mp_linear_kernel``.
 
     Args:
         quant_config: The AutoGPTQ quantization config.
@@ -316,12 +318,6 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.input_dtype = None
         self.quant_type = self.quant_config.quant_type
-
-        # Verify supported on platform.
-        verify_marlin_supported(
-            quant_type=self.quant_config.quant_type,
-            group_size=self.quant_config.group_size,
-        )
 
     def create_weights(
         self,

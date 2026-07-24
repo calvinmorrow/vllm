@@ -16,6 +16,7 @@ from vllm.model_executor.parameter import (
     PackedvLLMParameter,
     RowvLLMParameter,
 )
+from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 from .inc_scheme import INCLinearScheme
@@ -47,17 +48,35 @@ class INCWNA16LinearScheme(INCLinearScheme):
             (4, True): scalar_types.uint4b8,
             (8, True): scalar_types.uint8b128,
         }
+        config_supported = (
+            self.layer_config.bits,
+            self.layer_config.sym,
+        ) in gptq_type_map
+
+        # Explicit Marlin backend on ROCm is not supported
+        if current_platform.is_rocm() and "marlin" in self.layer_config.backend:
+            raise ValueError(
+                f"AutoRound GPTQ does not support "
+                f"backend='{self.layer_config.backend}' on ROCm. "
+                f"Use backend='auto' to select a ROCm-compatible kernel."
+            )
+
         use_marlin = (
             self.layer_config.backend == "auto" or "marlin" in self.layer_config.backend
-        ) and (self.layer_config.bits, self.layer_config.sym) in gptq_type_map
-        if use_marlin:
+        ) and config_supported
+
+        if current_platform.is_rocm() and config_supported:
+            # On ROCm, use Triton/RDNA W4A16 kernels via AutoGPTQLinearMethod
+            # without requiring Marlin capability.
+            pass
+        elif use_marlin:
             use_marlin = check_marlin_supported(
                 gptq_type_map[(self.layer_config.bits, self.layer_config.sym)],
                 self.layer_config.group_size,
                 has_zp=not self.layer_config.sym,
             )
 
-        if use_marlin:
+        if use_marlin or (current_platform.is_rocm() and config_supported):
             from vllm.model_executor.layers.quantization.auto_gptq import (
                 AutoGPTQLinearMethod,
             )
@@ -78,7 +97,7 @@ class INCWNA16LinearScheme(INCLinearScheme):
             f"INC quantization with bits={self.layer_config.bits}, "
             f"sym={self.layer_config.sym} is not supported. "
             "Only 4-bit and 8-bit symmetric quantization is supported "
-            "with Marlin kernels."
+            "with Marlin kernels (CUDA) or Triton/RDNA W4A16 kernels (ROCm)."
         )
 
     def _build_awq_method(self):

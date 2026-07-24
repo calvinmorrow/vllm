@@ -916,3 +916,162 @@ class TestGetLayerConfigFusedQKV:
             DummyLayer(), "model.layers.0.self_attn.qkv_proj"
         )
         assert bits == 8
+
+
+# ---------------------------------------------------------------------------
+# ROCm AutoRound GPTQ tests
+# ---------------------------------------------------------------------------
+
+
+def test_wna16_rocm_auto_gptq_builds_without_marlin(monkeypatch) -> None:
+    """ROCm symmetric W4A16 GPTQ should build AutoGPTQLinearMethod
+    without requiring Marlin support."""
+    captured = {}
+
+    class DummyMethod:
+        def __init__(self, cfg):
+            captured["cfg"] = cfg
+
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.auto_gptq.AutoGPTQLinearMethod",
+        DummyMethod,
+    )
+
+    scheme = INCWNA16LinearScheme(make_layer_config())
+
+    assert isinstance(scheme.inner_method, DummyMethod)
+    assert isinstance(captured["cfg"], AutoGPTQConfig)
+    assert captured["cfg"].weight_bits == 4
+    assert captured["cfg"].group_size == 128
+    assert captured["cfg"].is_sym is True
+
+
+def test_wna16_rocm_backend_auto_works(monkeypatch) -> None:
+    """ROCm backend='auto' should build without Marlin check."""
+    captured = {}
+
+    class DummyMethod:
+        def __init__(self, cfg):
+            captured["cfg"] = cfg
+
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.auto_gptq.AutoGPTQLinearMethod",
+        DummyMethod,
+    )
+
+    layer_cfg = make_layer_config(backend="auto")
+    scheme = INCWNA16LinearScheme(layer_cfg)
+
+    assert isinstance(scheme.inner_method, DummyMethod)
+
+
+def test_wna16_rocm_backend_marlin_raises(monkeypatch) -> None:
+    """Explicit backend='marlin' on ROCm should raise ValueError."""
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+
+    layer_cfg = make_layer_config(backend="marlin")
+    with pytest.raises(ValueError, match="does not support backend='marlin' on ROCm"):
+        INCWNA16LinearScheme(layer_cfg)
+
+
+def test_wna16_rocm_backend_gptq_marlin_raises(monkeypatch) -> None:
+    """Explicit backend='gptq:marlin' on ROCm should raise ValueError."""
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+
+    layer_cfg = make_layer_config(backend="gptq:marlin")
+    with pytest.raises(
+        ValueError, match="does not support backend='gptq:marlin' on ROCm"
+    ):
+        INCWNA16LinearScheme(layer_cfg)
+
+
+def test_wna16_rocm_8bit_sym_builds(monkeypatch) -> None:
+    """ROCm 8-bit symmetric W8A16 GPTQ should build AutoGPTQLinearMethod."""
+    captured = {}
+
+    class DummyMethod:
+        def __init__(self, cfg):
+            captured["cfg"] = cfg
+
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.auto_gptq.AutoGPTQLinearMethod",
+        DummyMethod,
+    )
+
+    layer_cfg = make_layer_config(bits=8, sym=True)
+    scheme = INCWNA16LinearScheme(layer_cfg)
+
+    assert isinstance(scheme.inner_method, DummyMethod)
+    assert captured["cfg"].weight_bits == 8
+
+
+def test_wna16_rocm_asymmetric_raises(monkeypatch) -> None:
+    """ROCm asymmetric quantization should still raise NotImplementedError."""
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+
+    layer_cfg = make_layer_config(sym=False)
+    with pytest.raises(NotImplementedError):
+        INCWNA16LinearScheme(layer_cfg)
+
+
+def test_wna16_rocm_unsupported_bits_raises(monkeypatch) -> None:
+    """ROCm INT2 should still raise NotImplementedError."""
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+
+    layer_cfg = make_layer_config(bits=2, sym=True)
+    with pytest.raises(NotImplementedError):
+        INCWNA16LinearScheme(layer_cfg)
+
+
+# ---------------------------------------------------------------------------
+# AutoGPTQLinearMethod construction tests
+# ---------------------------------------------------------------------------
+
+
+def test_auto_gptq_linear_method_no_marlin_check_at_init() -> None:
+    """AutoGPTQLinearMethod should not call verify_marlin_supported at init.
+
+    The Marlin check was removed to allow ROCm to use Triton/RDNA kernels
+    through choose_mp_linear_kernel in create_weights().
+    """
+    from vllm.model_executor.layers.quantization.auto_gptq import (
+        AutoGPTQLinearMethod,
+    )
+
+    # Should not raise — no unconditional Marlin verification at construction
+    cfg = AutoGPTQConfig(
+        weight_bits=4,
+        group_size=128,
+        desc_act=False,
+        is_sym=True,
+        lm_head_quantized=False,
+        dynamic={},
+        full_config={},
+    )
+    method = AutoGPTQLinearMethod(cfg)
+    assert method.quant_type == cfg.quant_type
+    assert method.quant_config is cfg

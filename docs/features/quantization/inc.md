@@ -84,3 +84,33 @@ lm_eval --model vllm \
   --num_fewshot 5 \
   --batch_size 128
 ```
+
+## ROCm Support
+
+vLLM supports dense symmetric AutoRound GPTQ W4A16 (`auto_round:auto_gptq`)
+inference on AMD ROCm GPUs through Triton/RDNA W4A16 kernels.
+
+### Supported on ROCm
+
+- **W4A16**: 4-bit symmetric GPTQ (`bits=4`, `sym=true`, `desc_act=false`)
+- **W8A16**: 8-bit symmetric GPTQ (`bits=8`, `sym=true`)
+- Group sizes: `-1`, `32`, `64`, `128`, `256`
+- Activation dtypes: FP16, BF16
+- Tensor parallelism: TP=1 (TP>1 requires additional validation)
+
+### Not yet supported on ROCm
+
+- `auto_round:auto_awq` packing format
+- Asymmetric quantization (`sym=false`)
+- INT2 / INT3 / INT8 weight-only quantization
+- Activation reordering (`desc_act=true`)
+- MoE (Mixture of Experts) AutoRound models
+- Forced `backend="marlin"` (Marlin is NVIDIA-only; use `backend="auto"`)
+
+### Example: ROCm inference
+
+```bash
+vllm serve OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 4096
+```

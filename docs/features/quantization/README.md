@@ -50,8 +50,9 @@ th:not(:first-child) {
 | Implementation            | Volta | Turing | Ampere | Ada | Hopper | AMD GPU | Intel GPU | x86 CPU | Arm CPU |
 | ------------------------- | ----- | ------ | ------ | --- | ------ | ------- | --------- | ------- | ------- |
 | AWQ                       | ❌    | ✅︎     | ✅︎     | ✅︎  | ✅︎     | ❌      | ✅︎        | ✅︎      | ❌      |
-| GPTQ                      | ✅︎    | ✅︎     | ✅︎     | ✅︎  | ✅︎     | ❌      | ✅︎        | ✅︎      | ❌      |
+| GPTQ                      | ✅︎    | ✅︎     | ✅︎     | ✅︎  | ✅︎     | ✅︎*     | ✅︎        | ✅︎      | ❌      |
 | Marlin (GPTQ/AWQ/FP8/FP4) | ❌    | ✅︎*    | ✅︎     | ✅︎  | ✅︎     | ❌      | ❌        | ❌      | ❌      |
+| AutoRound (INC)           | ❌    | ✅︎     | ✅︎     | ✅︎  | ✅︎     | ✅︎*     | ✅︎        | ✅︎      | ❌      |
 | llm-compressor INT8 (W8A8)| ❌    | ✅︎     | ✅︎     | ✅︎  | ✅︎     | ❌      | ❌        | ✅︎      | ✅︎      |
 | llm-compressor INT8 (W4A8)| ❌    | ❌     | ❌     | ❌  | ❌     | ❌      | ❌        | ❌      | ✅︎      |
 | llm-compressor FP8 (W8A8) | ❌    | ❌     | ❌     | ✅︎  | ✅︎     | ✅︎      | ❌        | ❌      | ❌      |
@@ -62,6 +63,13 @@ th:not(:first-child) {
 - Volta refers to SM 7.0, Turing to SM 7.5, Ampere to SM 8.0/8.6, Ada to SM 8.9, and Hopper to SM 9.0.
 - ✅︎ indicates that the quantization method is supported on the specified hardware.
 - ❌ indicates that the quantization method is not supported on the specified hardware.
+- *GPTQ on AMD GPU supports dense symmetric W4A16 and W8A16 through Triton/RDNA
+  W4A16 kernels (Marlin is NVIDIA-only). Asymmetric, MoE, and auto_awq packing
+  are not yet supported on ROCm.
+- *AutoRound (INC) on AMD GPU supports dense symmetric W4A16 and W8A16
+  (`auto_round:auto_gptq`) through Triton/RDNA W4A16 kernels.
+  `auto_round:auto_awq`, asymmetric, MoE, INT2/INT3, and `desc_act=true`
+  are not yet supported on ROCm.
 - All Intel Gaudi quantization support has been migrated to [vLLM-Gaudi](https://github.com/vllm-project/vllm-gaudi).
 - *Turing does not support Marlin MXFP4.
 
