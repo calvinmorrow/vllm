@@ -117,7 +117,7 @@ def _topk_sort_kernel(
     mask = offsets < n_comp
     scores_off = row * stride_scores + offsets
     vals = tl.where(mask, tl.load(scores_ptr + scores_off), -float("inf"))
-    idxs = tl.where(mask, offsets, tl.full_like(offsets, -1))
+    idxs = tl.where(mask, offsets, -1)
 
     # Pack score+index into float64 for sorting
     # Higher score + lower index = higher packed value
@@ -164,7 +164,7 @@ def _topk_chunk_kernel(
     mask = offsets < actual_chunk_n
     scores_off = row * stride_scores + abs_offsets
     vals = tl.where(mask, tl.load(scores_ptr + scores_off), -float("inf"))
-    idxs = tl.where(mask, abs_offsets, tl.full_like(abs_offsets, -1))
+    idxs = tl.where(mask, abs_offsets, -1)
 
     packed = _pack_score_idx(vals, idxs, _SCORE_SCALE)
     packed_sorted = tl.sort(packed, descending=True)
