@@ -332,6 +332,62 @@ def test_rdna_hybrid_w4a16_process_weights_symmetric_repack(group_size, dist_ini
     torch.testing.assert_close(layer.weight_scale, scales_ckpt_nkg)
 
 
+@pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
+def test_rdna_hybrid_w4a16_ignores_symmetric_gptq_qzeros(dist_init):
+    """Symmetric GPTQ qzeros placeholders are not passed to the kernel."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP device not available")
+
+    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+        MPLinearLayerConfig,
+    )
+    from vllm.scalar_type import scalar_types
+
+    set_random_seed(0)
+
+    K, N, G = 4096, 1536, 128
+    w_int4_kn = torch.randint(0, 16, (K, N), device=device, dtype=torch.int32)
+    w_ckpt_nk8 = _pack_int4_along_k_to_ckpt(w_int4_kn)
+    scales_ckpt_nkg = 0.05 * torch.rand(
+        (N, K // G), device=device, dtype=torch.float16
+    )
+    qzeros_ckpt = torch.randint(
+        0, 16, (K // G, N // 8), device=device, dtype=torch.int32
+    )
+    layer = _build_dummy_layer(w_ckpt_nk8, scales_ckpt_nkg, qzeros_ckpt)
+
+    config = MPLinearLayerConfig(
+        full_weight_shape=(K, N),
+        partition_weight_shape=(K, N),
+        weight_type=scalar_types.uint4b8,
+        act_type=torch.float16,
+        group_size=G,
+        zero_points=False,
+        has_g_idx=False,
+    )
+    kernel = RDNAHybridW4A16LinearKernel(
+        config,
+        w_q_param_name="weight_packed",
+        w_s_param_name="weight_scale",
+        w_zp_param_name="weight_zero_point",
+        w_gidx_param_name=None,
+    )
+    kernel.process_weights_after_loading(layer)
+
+    x = torch.randn((1, K), device=device, dtype=torch.float16)
+    output = kernel.apply_weights(layer, x)
+    reference = _rdna_hybrid_w4a16_reference(
+        x,
+        w_int4_kn.t().contiguous(),
+        scales_ckpt_nkg,
+        None,
+        G,
+        bias=None,
+    )
+
+    torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
+
+
 @pytest.mark.parametrize("group_size", SUPPORTED_GROUP_SIZES)
 def test_rdna_hybrid_w4a16_process_weights_asymmetric_repack(group_size, dist_init):
     """uint4 (asymmetric): zero points unpacked to raw values in act dtype."""

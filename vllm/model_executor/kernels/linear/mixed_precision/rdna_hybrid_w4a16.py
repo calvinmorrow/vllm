@@ -542,6 +542,7 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         c = self.config
         w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+        w_zp = None if c.weight_type.has_bias() else w_zp
 
         x_2d = x.reshape(-1, x.shape[-1])
         N = w_q.shape[0]
