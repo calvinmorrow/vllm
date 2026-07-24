@@ -94,17 +94,12 @@ def rocm_triton_sparse_attn_indexer(
             ((total_seq_lens, head_dim), fp8_dtype),
             ((total_seq_lens, 4), torch.uint8),
         )
-        if _on_gfx942() or _on_gfx950():
-            workspace_manager.get_simultaneous(
-                ((hidden_states.shape[0], max_model_len), torch.float32),
-            )
-        else:
-            workspace_manager.get_simultaneous(
-                (
-                    (q_fp8.shape[1], hidden_states.shape[0], max_model_len),
-                    torch.float32,
-                ),
-            )
+        # Decode logits buffer: gfx1151 Triton path uses
+        # fp8_paged_mqa_logits_torch which returns 2D logits
+        # [batch_size * next_n, max_model_len], not 3D.
+        workspace_manager.get_simultaneous(
+            ((hidden_states.shape[0], max_model_len), torch.float32),
+        )
         max_logits_elems = (
             envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         )
