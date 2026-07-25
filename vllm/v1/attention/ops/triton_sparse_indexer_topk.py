@@ -47,42 +47,40 @@ def _pytorch_topk(scores: torch.Tensor, top_k: int) -> torch.Tensor:
     Positions with -inf scores are excluded (replaced with -1 padding).
     Returns [num_tokens, top_k] int32 indices with -1 padding.
 
-    Replaces the broken float64 pack/sort/unpack Triton kernels
-    that don't work on gfx1151 (ROCm float64 precision issues).
+    Uses numpy stable sort to guarantee correct tie-breaking regardless
+    of torch.sort stability on the target backend (ROCm sort is unstable).
     """
+    import numpy as np
+
     num_tokens, n_comp = scores.shape
     device = scores.device
 
-    # Build a composite sort key on the ORIGINAL data:
-    #   key[i] = scores[i] - epsilon * i
-    # Higher score wins; for equal scores, lower index wins
-    # (because subtracting epsilon*i makes smaller i give a larger key).
-    # epsilon = 1/(n_comp+1) is tiny enough that it never flips
-    # the ordering of genuinely different scores.
-    epsilon = 1.0 / (n_comp + 1)
-    indices = torch.arange(n_comp, device=device, dtype=torch.float32)
-    composite_key = scores - epsilon * indices
+    # numpy stable sort: negate scores so ascending argsort = descending score.
+    # Stable sort preserves original index order for equal scores (ascending).
+    scores_np = scores.cpu().numpy()
+    indices_np = np.arange(n_comp, dtype=np.intp)
 
-    # Single descending sort by composite key gives correct ordering.
-    _, final_indices = torch.sort(composite_key, dim=-1, descending=True)
+    # Sort indices by negated scores (stable)
+    sort_perm = np.argsort(-scores_np, axis=1, kind="stable")
 
-    # Mask out -inf positions: only include finite scores
-    final_scores = torch.gather(scores, dim=-1, index=final_indices)
-    is_valid = torch.isfinite(final_scores)
+    # Gather sorted indices and scores
+    sorted_indices = np.take_along_axis(indices_np, sort_perm, axis=1)
+    sorted_scores = np.take_along_axis(scores_np, sort_perm, axis=1)
 
-    # Build result with -1 for invalid, cast to int32
-    result = torch.where(
-        is_valid,
-        final_indices.to(torch.int32),
-        torch.full_like(final_indices, -1, dtype=torch.int32),
-    )
+    # Mask: keep only finite scores; replace rest with -1
+    valid = np.isfinite(sorted_scores)
+    sorted_indices[~valid] = -1
 
-    # Pad to top_k if n_comp < top_k
-    k = max(n_comp, top_k)
-    padded = torch.full((num_tokens, k), -1, dtype=torch.int32, device=device)
-    padded[:, :n_comp] = result[:, :n_comp]
+    # Take top_k columns
+    k = min(top_k, n_comp)
+    result_np = sorted_indices[:, :k]
 
-    return padded[:, :top_k]
+    # Pad to top_k rows if n_comp < top_k
+    if n_comp < top_k:
+        pad = np.full((num_tokens, top_k - n_comp), -1, dtype=np.intp)
+        result_np = np.hstack([result_np, pad])
+
+    return torch.from_numpy(result_np).to(device, dtype=torch.int32)
 
 
 @triton.jit
