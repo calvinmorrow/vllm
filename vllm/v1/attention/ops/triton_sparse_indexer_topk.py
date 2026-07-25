@@ -58,7 +58,7 @@ def _pytorch_topk(scores: torch.Tensor, top_k: int) -> torch.Tensor:
     # numpy stable sort: negate scores so ascending argsort = descending score.
     # Stable sort preserves original index order for equal scores (ascending).
     scores_np = scores.cpu().numpy()
-    indices_np = np.arange(n_comp, dtype=np.intp)
+    indices_np = np.arange(n_comp, dtype=np.intp).reshape(1, -1)
 
     # Sort indices by negated scores (stable)
     sort_perm = np.argsort(-scores_np, axis=1, kind="stable")
