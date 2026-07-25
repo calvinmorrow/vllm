@@ -2,12 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 import torch
+from torch.library import infer_schema
 
 from vllm.utils.torch_utils import (
     common_broadcastable_dtype,
     current_stream,
     is_lossless_cast,
 )
+
+
+def test_sparse_indexer_custom_op_accepts_layer_name():
+    from vllm.v1.attention.ops.rocm_triton_sparse_indexer import (
+        rocm_triton_sparse_attn_indexer,
+    )
+
+    schema = infer_schema(
+        rocm_triton_sparse_attn_indexer,
+        mutates_args={"topk_indices_buffer"},
+    )
+
+    assert "vllm.utils.torch_utils.LayerName k_cache_prefix" in schema
 
 
 @pytest.mark.parametrize(
