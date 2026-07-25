@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
+
 import pytest
 import torch
 from torch.library import infer_schema
 
 from vllm.utils.torch_utils import (
+    LayerNameType,
     common_broadcastable_dtype,
     current_stream,
     is_lossless_cast,
@@ -16,12 +19,19 @@ def test_sparse_indexer_custom_op_accepts_layer_name():
         rocm_triton_sparse_attn_indexer,
     )
 
+    layer_name_annotation = (
+        inspect.signature(rocm_triton_sparse_attn_indexer)
+        .parameters["k_cache_prefix"]
+        .annotation
+    )
+    assert layer_name_annotation is LayerNameType
+
     schema = infer_schema(
         rocm_triton_sparse_attn_indexer,
         mutates_args={"topk_indices_buffer"},
     )
 
-    assert "vllm.utils.torch_utils.LayerName k_cache_prefix" in schema
+    assert "k_cache_prefix" in schema
 
 
 @pytest.mark.parametrize(

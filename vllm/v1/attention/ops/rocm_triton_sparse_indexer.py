@@ -10,8 +10,6 @@ rocm_fp8_paged_mqa_logits) and K-cache management from
 rocm_aiter_mla_sparse.py. Only the top-k selection step is replaced.
 """
 
-from __future__ import annotations
-
 import torch
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
