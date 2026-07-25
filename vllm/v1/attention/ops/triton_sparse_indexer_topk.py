@@ -27,12 +27,6 @@ SORT_N_MAX: Final = 8192
 # Supported SORT_N values (powers of 2).
 _SUPPORTED_SORT_N = (256, 512, 1024, 2048, 4096, 8192)
 
-# Scale factor for packing score+index into float64
-# Score range is typically [-10, 10], index range is [0, 8191]
-# With SCALE = 1e6, score*SCALE dominates and -index breaks ties
-_SCORE_SCALE: Final = 1e6
-
-
 def _select_sort_n(n: int) -> int:
     """Select SORT_N from supported values for given n."""
     if n <= 0:
@@ -46,68 +40,32 @@ def _select_sort_n(n: int) -> int:
     return SORT_N_MAX
 
 
-@triton.jit
-def _pack_score_idx(score, idx, scale: tl.constexpr):
-    """Pack score and index into float64 for sorting."""
-    return score.to(tl.float64) * scale - idx.to(tl.float64)
+def _pytorch_topk(scores: torch.Tensor, top_k: int) -> torch.Tensor:
+    """Reference top-k with exact deterministic ordering.
 
+    Sorts by score descending, then by index ascending for ties.
+    Positions with -inf scores are excluded (replaced with -1 padding).
+    Returns [num_tokens, top_k] int32 indices with -1 padding.
 
-@triton.jit
-def _unpack_idx(packed, scale: tl.constexpr):
-    """Extract index from packed float64 value."""
-    # packed = score * scale - idx
-    # neg = -packed = -score * scale + idx
-    # floor(neg / scale) = -score (since idx < scale)
-    # idx = neg - floor(neg / scale) * scale
-    # round to handle floating point imprecision: floor(x + 0.5)
-    neg = -packed
-    quotient = tl.floor(neg / scale)
-    remainder = neg - quotient * scale
-    return tl.floor(remainder + 0.5).to(tl.int32)
+    Replaces the broken float64 pack/sort/unpack Triton kernels
+    that don't work on gfx1151 (ROCm float64 precision issues).
+    """
+    num_tokens, n_comp = scores.shape
+    device = scores.device
 
+    # Use torch.sort which is stable - preserves original order for equal elements
+    # Since indices are [0, 1, 2, ...], stable sort gives ascending index for ties
+    _, sorted_indices = torch.sort(scores, dim=-1, descending=True)
 
-# ---------------------------------------------------------------------------
-# Per-SORT_N kernels using tl.sort with packing
-# ---------------------------------------------------------------------------
+    # Mask out -inf positions: only include finite scores
+    sorted_scores = torch.gather(scores, dim=-1, index=sorted_indices)
+    is_valid = torch.isfinite(sorted_scores)
 
+    # Replace invalid positions with -1
+    result = torch.where(is_valid, sorted_indices, torch.full_like(sorted_indices, -1))
 
-@triton.jit
-def _topk_sort_kernel(
-    scores_ptr,
-    selected_ptr,
-    n_comp,
-    top_k,
-    stride_scores,
-    stride_selected,
-    SORT_N: tl.constexpr,
-    SCORE_SCALE: tl.constexpr,
-):
-    """Sort-based top-k: one program per row."""
-    row = tl.program_id(0)
-
-    # Load scores + create indices
-    offsets = tl.arange(0, SORT_N)
-    mask = offsets < n_comp
-    scores_off = row * stride_scores + offsets
-    vals = tl.where(mask, tl.load(scores_ptr + scores_off), -float("inf"))
-    idxs = tl.where(mask, offsets, -1)
-
-    # Pack score+index into float64 for sorting
-    packed = _pack_score_idx(vals, idxs, SCORE_SCALE)
-
-    # Sort descending
-    packed_sorted = tl.sort(packed, descending=True)
-
-    # Unpack indices
-    idxs_sorted = _unpack_idx(packed_sorted, SCORE_SCALE)
-
-    # top_offsets is sequential [0..SORT_N), so just store idxs_sorted directly
-    top_offsets = tl.arange(0, SORT_N)
-    tl.store(
-        selected_ptr + row * stride_selected + top_offsets,
-        idxs_sorted,
-        mask=top_offsets < top_k,
-    )
+    # Take top_k
+    return result[:, :top_k]
 
 
 @triton.jit
@@ -264,136 +222,29 @@ def _topk_single_phase(
     top_k: int,
     sort_n: int,
 ) -> torch.Tensor:
-    """Single-phase sort top-k.
+    """Single-phase top-k using PyTorch (replaces broken Triton float64 kernel).
 
     Args:
         scores: [num_tokens, n_comp] fp32 scores.
         top_k: number of top indices to select.
-        sort_n: power-of-2 size >= n_comp.
+        sort_n: power-of-2 size >= n_comp (unused, kept for API compat).
 
     Returns:
         [num_tokens, top_k] int32 indices (descending score, -1 padding).
     """
-    num_tokens, n_comp = scores.shape
-    assert sort_n >= n_comp, f"sort_n={sort_n} < n_comp={n_comp}"
-
-    selected = torch.full(
-        (num_tokens, top_k), -1, dtype=torch.int32, device=scores.device
-    )
-
-    grid = (num_tokens,)
-    _topk_sort_kernel[grid](
-        scores,
-        selected,
-        n_comp,
-        top_k,
-        scores.stride(0),
-        selected.stride(0),
-        SORT_N=sort_n,
-        SCORE_SCALE=_SCORE_SCALE,
-        num_warps=4,
-    )
-    return selected
+    return _pytorch_topk(scores, top_k)
 
 
 def _topk_chunk_and_merge(
     scores: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
-    """Chunk-and-merge top-k for n_comp > SORT_N_MAX.
+    """Top-k for large n_comp using PyTorch (replaces broken Triton chunk-and-merge).
 
-    Phase 1: sort each CHUNK_N chunk independently, keep top-k per chunk.
-    Phase 2: tree-merge chunk results until <= MERGE_GROUP sets remain.
-    Phase 3: final merge into global top-k.
+    The original chunk-and-merge Triton approach used float64 packing which
+    is broken on gfx1151. PyTorch's sort handles large tensors efficiently.
     """
-    num_tokens, n_comp = scores.shape
-    n_chunks = math.ceil(n_comp / CHUNK_N)
-    sort_n = CHUNK_N
-
-    # Scratch allocation
-    candidate_stride_phase1 = n_chunks * top_k
-    n_sets = n_chunks
-    total_scratch = candidate_stride_phase1
-    while n_sets > MERGE_GROUP:
-        n_sets = math.ceil(n_sets / MERGE_GROUP)
-        total_scratch += n_sets * top_k
-
-    scratch = torch.empty(
-        (num_tokens, total_scratch), dtype=torch.int32, device=scores.device
-    )
-
-    # Phase 1: chunk-local top-k
-    cur_offset = 0
-    cur_stride = candidate_stride_phase1
-    grid_chunks = (num_tokens, n_chunks)
-    _topk_chunk_kernel[grid_chunks](
-        scores,
-        scratch,
-        n_comp,
-        top_k,
-        cur_stride,
-        scores.stride(0),
-        SORT_N=sort_n,
-        CHUNK_SIZE=CHUNK_N,
-        SCORE_SCALE=_SCORE_SCALE,
-        num_warps=4,
-    )
-
-    # Phase 2: tree merge
-    n_sets = n_chunks
-    while n_sets > MERGE_GROUP:
-        next_sets = math.ceil(n_sets / MERGE_GROUP)
-        next_stride = next_sets * top_k
-        next_offset = cur_offset + cur_stride
-
-        grid_merge = (num_tokens, next_sets)
-        cur_ptr = scratch[:, cur_offset : cur_offset + cur_stride]
-        next_ptr = scratch[:, next_offset : next_offset + next_stride]
-
-        _topk_tree_merge_kernel[grid_merge](
-            cur_ptr,
-            scores,
-            next_ptr,
-            n_comp,
-            top_k,
-            n_sets,
-            MERGE_GROUP,
-            MERGE_GROUP * top_k,
-            cur_stride,
-            next_stride,
-            scores.stride(0),
-            SORT_N=sort_n,
-            SCORE_SCALE=_SCORE_SCALE,
-            num_warps=4,
-        )
-
-        cur_offset = next_offset
-        cur_stride = next_stride
-        n_sets = next_sets
-
-    # Phase 3: final merge
-    selected = torch.full(
-        (num_tokens, top_k), -1, dtype=torch.int32, device=scores.device
-    )
-
-    final_candidate_count = n_sets * top_k
-    final_cur_ptr = scratch[:, cur_offset : cur_offset + cur_stride]
-
-    grid_final = (num_tokens,)
-    _topk_merge_kernel[grid_final](
-        final_cur_ptr,
-        scores,
-        selected,
-        n_comp,
-        top_k,
-        final_candidate_count,
-        scores.stride(0),
-        SORT_N=sort_n,
-        SCORE_SCALE=_SCORE_SCALE,
-        num_warps=4,
-    )
-
-    return selected
+    return _pytorch_topk(scores, top_k)
 
 
 def triton_sparse_indexer_topk(

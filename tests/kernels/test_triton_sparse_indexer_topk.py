@@ -348,11 +348,10 @@ class TestGfx1151Hardware:
             scores = torch.randn(8, n_comp, device="cuda", dtype=torch.float32)
             result = triton_sparse_indexer_topk(scores, 512)
             expected = _ref_topk(scores, 512).to("cuda")
-            torch.testing.assert_close(
-                result,
-                expected,
-                err_msg=f"Failed for n_comp={n_comp}",
-            )
+            try:
+                torch.testing.assert_close(result, expected)
+            except AssertionError as e:
+                raise AssertionError(f"Failed for n_comp={n_comp}: {e}") from e
 
     def test_long_context_chunk_and_merge(self):
         """Test chunk-and-merge with long context."""
