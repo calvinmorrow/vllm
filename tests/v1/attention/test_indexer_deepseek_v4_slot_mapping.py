@@ -5,9 +5,34 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import create_vllm_config
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
+from vllm.v1.attention.backends.mla import indexer
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+@pytest.mark.parametrize(
+    ("is_rocm", "on_gfx1151", "expected"),
+    [
+        (True, True, AttentionCGSupport.NEVER),
+        (True, False, AttentionCGSupport.UNIFORM_BATCH),
+        (False, True, AttentionCGSupport.UNIFORM_BATCH),
+    ],
+)
+def test_indexer_cudagraph_support_excludes_gfx1151(
+    monkeypatch, is_rocm, on_gfx1151, expected
+):
+    monkeypatch.setattr(indexer.current_platform, "is_rocm", lambda: is_rocm)
+    monkeypatch.setattr(
+        indexer.current_platform,
+        "on_gfx1151",
+        lambda: on_gfx1151,
+        raising=False,
+    )
+
+    support = DeepseekV32IndexerMetadataBuilder.get_cudagraph_support(None, None)
+
+    assert support is expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

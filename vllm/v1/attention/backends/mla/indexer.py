@@ -465,6 +465,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
+        if current_platform.is_rocm() and current_platform.on_gfx1151():
+            return AttentionCGSupport.NEVER
         return AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, *args, **kwargs):
