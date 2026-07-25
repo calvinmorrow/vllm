@@ -61,11 +61,19 @@ def _pytorch_topk(scores: torch.Tensor, top_k: int) -> torch.Tensor:
     sorted_scores = torch.gather(scores, dim=-1, index=sorted_indices)
     is_valid = torch.isfinite(sorted_scores)
 
-    # Replace invalid positions with -1
-    result = torch.where(is_valid, sorted_indices, torch.full_like(sorted_indices, -1))
+    # Build result with -1 for invalid, cast to int32
+    result = torch.where(
+        is_valid,
+        sorted_indices.to(torch.int32),
+        torch.full_like(sorted_indices, -1, dtype=torch.int32),
+    )
 
-    # Take top_k
-    return result[:, :top_k]
+    # Pad to top_k if n_comp < top_k
+    k = max(n_comp, top_k)
+    padded = torch.full((num_tokens, k), -1, dtype=torch.int32, device=device)
+    padded[:, :n_comp] = result[:, :n_comp]
+
+    return padded[:, :top_k]
 
 
 @triton.jit
