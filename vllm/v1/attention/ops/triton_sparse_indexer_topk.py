@@ -53,19 +53,34 @@ def _pytorch_topk(scores: torch.Tensor, top_k: int) -> torch.Tensor:
     num_tokens, n_comp = scores.shape
     device = scores.device
 
-    # Use torch.sort which is stable - preserves original order for equal elements
-    # Since indices are [0, 1, 2, ...], stable sort gives ascending index for ties
+    # torch.sort is not guaranteed stable on all backends (ROCm),
+    # so we explicitly enforce tie-breaking: index ascending for equal scores.
+    # Use torch.sort as initial ordering, then fix tie groups.
     _, sorted_indices = torch.sort(scores, dim=-1, descending=True)
 
-    # Mask out -inf positions: only include finite scores
+    # Get sorted scores to find equal-score groups
     sorted_scores = torch.gather(scores, dim=-1, index=sorted_indices)
-    is_valid = torch.isfinite(sorted_scores)
+
+    # For each row, fix tie-breaking within equal-score groups
+    # Build a correction key: score + epsilon * (-index)
+    # Higher score wins; for equal score, lower index wins
+    # epsilon = 1 / (n_comp + 1) ensures index tie-break never changes score order
+    epsilon = 1.0 / (n_comp + 1)
+    indices_float = sorted_indices.to(torch.float32)
+    correction_key = sorted_scores - epsilon * indices_float
+
+    # Re-sort by correction key (descending) to fix tie-breaking
+    _, final_indices = torch.sort(correction_key, dim=-1, descending=True)
+
+    # Mask out -inf positions: only include finite scores
+    final_scores = torch.gather(scores, dim=-1, index=final_indices)
+    is_valid = torch.isfinite(final_scores)
 
     # Build result with -1 for invalid, cast to int32
     result = torch.where(
         is_valid,
-        sorted_indices.to(torch.int32),
-        torch.full_like(sorted_indices, -1, dtype=torch.int32),
+        final_indices.to(torch.int32),
+        torch.full_like(final_indices, -1, dtype=torch.int32),
     )
 
     # Pad to top_k if n_comp < top_k
