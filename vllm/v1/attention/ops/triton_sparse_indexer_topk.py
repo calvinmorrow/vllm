@@ -53,24 +53,18 @@ def _pytorch_topk(scores: torch.Tensor, top_k: int) -> torch.Tensor:
     num_tokens, n_comp = scores.shape
     device = scores.device
 
-    # torch.sort is not guaranteed stable on all backends (ROCm),
-    # so we explicitly enforce tie-breaking: index ascending for equal scores.
-    # Use torch.sort as initial ordering, then fix tie groups.
-    _, sorted_indices = torch.sort(scores, dim=-1, descending=True)
-
-    # Get sorted scores to find equal-score groups
-    sorted_scores = torch.gather(scores, dim=-1, index=sorted_indices)
-
-    # For each row, fix tie-breaking within equal-score groups
-    # Build a correction key: score + epsilon * (-index)
-    # Higher score wins; for equal score, lower index wins
-    # epsilon = 1 / (n_comp + 1) ensures index tie-break never changes score order
+    # Build a composite sort key on the ORIGINAL data:
+    #   key[i] = scores[i] - epsilon * i
+    # Higher score wins; for equal scores, lower index wins
+    # (because subtracting epsilon*i makes smaller i give a larger key).
+    # epsilon = 1/(n_comp+1) is tiny enough that it never flips
+    # the ordering of genuinely different scores.
     epsilon = 1.0 / (n_comp + 1)
-    indices_float = sorted_indices.to(torch.float32)
-    correction_key = sorted_scores - epsilon * indices_float
+    indices = torch.arange(n_comp, device=device, dtype=torch.float32)
+    composite_key = scores - epsilon * indices
 
-    # Re-sort by correction key (descending) to fix tie-breaking
-    _, final_indices = torch.sort(correction_key, dim=-1, descending=True)
+    # Single descending sort by composite key gives correct ordering.
+    _, final_indices = torch.sort(composite_key, dim=-1, descending=True)
 
     # Mask out -inf positions: only include finite scores
     final_scores = torch.gather(scores, dim=-1, index=final_indices)
