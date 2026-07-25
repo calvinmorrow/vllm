@@ -23,12 +23,7 @@ def test_indexer_cudagraph_support_excludes_gfx1151(
     monkeypatch, is_rocm, on_gfx1151, expected
 ):
     monkeypatch.setattr(indexer.current_platform, "is_rocm", lambda: is_rocm)
-    monkeypatch.setattr(
-        indexer.current_platform,
-        "on_gfx1151",
-        lambda: on_gfx1151,
-        raising=False,
-    )
+    monkeypatch.setattr(indexer, "on_gfx1151", lambda: on_gfx1151, raising=False)
 
     support = DeepseekV32IndexerMetadataBuilder.get_cudagraph_support(None, None)
 
