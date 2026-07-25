@@ -539,6 +539,7 @@ def test_wna16_cpu_gptq_prefers_ark_when_available(monkeypatch) -> None:
 def test_wna16_cpu_gptq_raises_when_ark_and_marlin_unavailable(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
     monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
     monkeypatch.setattr(
@@ -585,7 +586,8 @@ def test_wna16_linear_gptq_uses_auto_gptq_when_supported(monkeypatch) -> None:
     assert captured["cfg"].is_sym is True
 
 
-def test_wna16_linear_gptq_unsupported_config_raises() -> None:
+def test_wna16_linear_gptq_unsupported_config_raises(monkeypatch) -> None:
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
     with pytest.raises(NotImplementedError, match="Only 4-bit and 8-bit symmetric"):
         INCWNA16LinearScheme(make_layer_config(sym=False))
 
@@ -730,6 +732,7 @@ def test_resolve_gptq_moe_falls_back_to_moe_wna16(monkeypatch) -> None:
 
 
 def test_resolve_gptq_moe_uses_auto_gptq_when_supported(monkeypatch) -> None:
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
     captured = {}
 
     class DummyMoeConfig:
@@ -999,52 +1002,31 @@ def test_wna16_rocm_backend_gptq_marlin_raises(monkeypatch) -> None:
         INCWNA16LinearScheme(layer_cfg)
 
 
-def test_wna16_rocm_8bit_sym_builds(monkeypatch) -> None:
-    """ROCm 8-bit symmetric W8A16 GPTQ should build AutoGPTQLinearMethod."""
-    captured = {}
-
-    class DummyMethod:
-        def __init__(self, cfg):
-            captured["cfg"] = cfg
-
+@pytest.mark.parametrize(
+    "layer_config",
+    [
+        make_layer_config(bits=8),
+        make_layer_config(bits=2),
+        make_layer_config(group_size=64),
+        make_layer_config(sym=False),
+    ],
+)
+def test_wna16_rocm_rejects_unsupported_gptq_before_kernel_selection(
+    monkeypatch, layer_config
+) -> None:
     monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
-    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.auto_gptq.AutoGPTQLinearMethod",
-        DummyMethod,
+        lambda *_: pytest.fail("kernel method must not be selected"),
     )
 
-    layer_cfg = make_layer_config(bits=8, sym=True)
-    scheme = INCWNA16LinearScheme(layer_cfg)
-
-    assert isinstance(scheme.inner_method, DummyMethod)
-    assert captured["cfg"].weight_bits == 8
-
-
-def test_wna16_rocm_asymmetric_raises(monkeypatch) -> None:
-    """ROCm asymmetric quantization should still raise NotImplementedError."""
-    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
-    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
-
-    layer_cfg = make_layer_config(sym=False)
-    with pytest.raises(NotImplementedError):
-        INCWNA16LinearScheme(layer_cfg)
-
-
-def test_wna16_rocm_unsupported_bits_raises(monkeypatch) -> None:
-    """ROCm INT2 should still raise NotImplementedError."""
-    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
-    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
-
-    layer_cfg = make_layer_config(bits=2, sym=True)
-    with pytest.raises(NotImplementedError):
-        INCWNA16LinearScheme(layer_cfg)
+    with pytest.raises(
+        NotImplementedError,
+        match="only for symmetric W4A16 with group_size=128",
+    ):
+        INCWna16Scheme().get_linear_method(
+            make_config(), object(), "layer", layer_config
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1249,44 +1231,35 @@ def test_rocm_moe_rejects_auto_awq_format(monkeypatch) -> None:
     assert captured["raw_config"]["zero_point"] is True
 
 
-def test_rocm_moe_non_symmetric_selects_moe_wna16(monkeypatch) -> None:
-    """Non-symmetric GPTQ AutoRound on ROCm creates MoeWNA16Method
-    with has_zp=True."""
-    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
-
-    class DummyMoeConfig:
-        pass
-
+@pytest.mark.parametrize(
+    "layer_config",
+    [
+        make_layer_config(bits=8),
+        make_layer_config(group_size=64),
+        make_layer_config(sym=False),
+    ],
+)
+def test_wna16_rocm_rejects_unsupported_gptq_moe_before_kernel_selection(
+    monkeypatch, layer_config
+) -> None:
     class DummyLayer:
-        moe_config = DummyMoeConfig()
+        moe_config = object()
 
-    captured = {}
-
-    class DummyMoeWNA16Method:
-        def __init__(self, cfg, moe):
-            captured["cfg"] = cfg
-            captured["moe"] = moe
-
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Method",
-        DummyMoeWNA16Method,
+        lambda *_: pytest.fail("kernel method must not be selected"),
     )
 
-    layer_config = INCLayerConfig(
-        bits=4,
-        group_size=128,
-        sym=False,
-        packing_format="auto_round:auto_gptq",
-        backend="auto",
-        data_type="int",
-        quantized=True,
-    )
-
-    result = _resolve_gptq_moe(DummyLayer(), layer_config)
-
-    assert isinstance(result, DummyMoeWNA16Method)
-    assert captured["cfg"].has_zp is True
-    assert captured["cfg"].weight_bits == 4
+    with pytest.raises(
+        NotImplementedError,
+        match="only for symmetric W4A16 with group_size=128",
+    ):
+        INCWna16Scheme().get_moe_method(
+            make_config(), DummyLayer(), "layer", layer_config
+        )
 
 
 def test_rocm_wna16_scheme_get_moe_method(monkeypatch) -> None:

@@ -39,9 +39,6 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
 
-if current_platform.is_rocm():
-    from vllm.platforms.rocm import on_gfx1151
-
 logger = init_logger(__name__)
 
 
@@ -468,7 +465,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
-        if current_platform.is_rocm() and on_gfx1151():
+        from vllm.v1.attention.ops.rocm_triton_sparse_indexer import (
+            is_rocm_triton_sparse_indexer_available,
+        )
+
+        if is_rocm_triton_sparse_indexer_available():
             return AttentionCGSupport.NEVER
         return AttentionCGSupport.UNIFORM_BATCH
 

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""gfx1151 Triton sparse indexer for DeepSeek V4.
+"""ROCm Triton sparse indexer for DeepSeek V4.
 
-Provides a Triton-based sparse indexer path for gfx1151 that replaces
-the AITER-only top-k selection with native Triton bitonic sort kernels.
+Provides a Triton-based sparse indexer path on supported ROCm devices that
+replaces the AITER-only top-k selection with a device-only stable-sort fallback.
 
 Reuses existing Triton score computation (rocm_fp8_mqa_logits,
 rocm_fp8_paged_mqa_logits) and K-cache management from
@@ -20,29 +20,14 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
-if current_platform.is_rocm():
-    from vllm.platforms.rocm import (
-        on_gfx942 as _on_gfx942,
-    )
-    from vllm.platforms.rocm import (
-        on_gfx950 as _on_gfx950,
-    )
-    from vllm.platforms.rocm import (
-        on_gfx1151 as _on_gfx1151,
-    )
-else:
-    _on_gfx942 = lambda: False  # type: ignore[assignment]
-    _on_gfx950 = lambda: False  # type: ignore[assignment]
-    _on_gfx1151 = lambda: False  # type: ignore[assignment]
 
+def is_rocm_triton_sparse_indexer_available() -> bool:
+    """Return whether the ROCm sparse-indexer fallback is available.
 
-def is_gfx1151_triton_sparse_indexer_available() -> bool:
-    """Return True when the gfx1151 Triton sparse-indexer path is available.
-
-    Narrow, operation-specific capability check. Does not affect AITER
-    eligibility or broad ROCm capability gates.
+    The Triton score-producing and cache dependencies have only been validated
+    on gfx1151. AITER is selected by the caller when enabled.
     """
-    return _on_gfx1151()
+    return current_platform.is_rocm() and current_platform.on_gfx1151()
 
 
 @eager_break_during_capture
@@ -62,7 +47,7 @@ def rocm_triton_sparse_attn_indexer(
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
 ) -> torch.Tensor:
-    """Sparse attention indexer for gfx1151 using Triton top-k selection.
+    """Sparse attention indexer using the ROCm Triton top-k fallback.
 
     Mirrors rocm_aiter_sparse_attn_indexer but replaces the
     torch.ops._C.top_k_per_row_prefill/decode calls with native
@@ -92,7 +77,7 @@ def rocm_triton_sparse_attn_indexer(
             ((total_seq_lens, head_dim), fp8_dtype),
             ((total_seq_lens, 4), torch.uint8),
         )
-        # Decode logits buffer: gfx1151 Triton path uses
+        # Decode logits buffer uses
         # fp8_paged_mqa_logits_torch which returns 2D logits
         # [batch_size * next_n, max_model_len], not 3D.
         workspace_manager.get_simultaneous(
@@ -254,7 +239,7 @@ def _rocm_triton_sparse_attn_indexer_fake(
     return topk_indices_buffer
 
 
-if _on_gfx1151():
+if is_rocm_triton_sparse_indexer_available():
     from vllm.utils.torch_utils import direct_register_custom_op
 
     direct_register_custom_op(

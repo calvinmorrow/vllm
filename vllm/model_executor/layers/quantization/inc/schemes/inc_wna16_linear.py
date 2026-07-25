@@ -25,6 +25,22 @@ if TYPE_CHECKING:
     from ..config_parser import INCLayerConfig
 
 
+ROCM_AUTOROUND_GPTQ_SUPPORTED_CONFIG = (4, 128, True)
+
+
+def validate_rocm_autoround_gptq_config(layer_config: "INCLayerConfig") -> None:
+    """Validate ROCm's supported AutoRound GPTQ W4A16 configuration."""
+    if (
+        layer_config.bits,
+        layer_config.group_size,
+        layer_config.sym,
+    ) != ROCM_AUTOROUND_GPTQ_SUPPORTED_CONFIG:
+        raise NotImplementedError(
+            "ROCm supports AutoRound GPTQ only for symmetric W4A16 "
+            "with group_size=128."
+        )
+
+
 class INCWNA16LinearScheme(INCLinearScheme):
     def __init__(self, layer_config: "INCLayerConfig") -> None:
         self.layer_config = layer_config
@@ -53,7 +69,10 @@ class INCWNA16LinearScheme(INCLinearScheme):
             self.layer_config.sym,
         ) in gptq_type_map
 
-        # Explicit Marlin backend on ROCm is not supported
+        if current_platform.is_rocm():
+            validate_rocm_autoround_gptq_config(self.layer_config)
+
+        # Explicit Marlin backend on ROCm is not supported.
         if current_platform.is_rocm() and "marlin" in self.layer_config.backend:
             raise ValueError(
                 f"AutoRound GPTQ does not support "
@@ -66,8 +85,8 @@ class INCWNA16LinearScheme(INCLinearScheme):
         ) and config_supported
 
         if current_platform.is_rocm() and config_supported:
-            # On ROCm, use Triton/RDNA W4A16 kernels via AutoGPTQLinearMethod
-            # without requiring Marlin capability.
+            # ROCm admits only symmetric AutoRound GPTQ W4A16, group size 128.
+            # AutoGPTQLinearMethod selects the ROCm-compatible kernel later.
             pass
         elif use_marlin:
             use_marlin = check_marlin_supported(
@@ -97,7 +116,8 @@ class INCWNA16LinearScheme(INCLinearScheme):
             f"INC quantization with bits={self.layer_config.bits}, "
             f"sym={self.layer_config.sym} is not supported. "
             "Only 4-bit and 8-bit symmetric quantization is supported "
-            "with Marlin kernels (CUDA) or Triton/RDNA W4A16 kernels (ROCm)."
+            "with Marlin kernels. ROCm additionally supports only symmetric "
+            "W4A16 with group_size=128."
         )
 
     def _build_awq_method(self):

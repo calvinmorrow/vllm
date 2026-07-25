@@ -122,7 +122,20 @@ def _warmup_layer_mhc(
                 scale,
                 base,
             )
-            layer.hc_post(layer_input, residual_slice, post_mix, comb_mix)
+            layer.mhc_fused_post_pre(
+                layer_input,
+                residual_slice,
+                post_mix,
+                comb_mix,
+                fn,
+                scale,
+                base,
+                layer.rms_norm_eps,
+                layer.hc_eps,
+                layer.hc_eps,
+                layer.hc_post_alpha,
+                layer.hc_sinkhorn_iters,
+            )
 
 
 def _warmup_hc_head(

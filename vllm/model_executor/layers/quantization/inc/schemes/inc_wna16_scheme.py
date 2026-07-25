@@ -124,9 +124,14 @@ def _resolve_gptq_moe(layer: "torch.nn.Module", layer_config: "INCLayerConfig"):
         check_moe_marlin_supports_layer,
     )
 
-    # On ROCm, Marlin MoE kernels are not available; use MoeWNA16Method
-    # which routes to TritonWNA16Experts via the WNA16 oracle.
+    # ROCm supports only symmetric AutoRound GPTQ W4A16 with group size 128.
+    # Validate before constructing a fallback method or selecting a kernel.
     if current_platform.is_rocm():
+        from .inc_wna16_linear import validate_rocm_autoround_gptq_config
+
+        validate_rocm_autoround_gptq_config(layer_config)
+        # Marlin MoE kernels are unavailable on ROCm. MoeWNA16Method routes to
+        # TritonWNA16Experts through the WNA16 oracle.
         moe_config = MoeWNA16Config.from_config(
             {
                 "quant_method": "gptq",

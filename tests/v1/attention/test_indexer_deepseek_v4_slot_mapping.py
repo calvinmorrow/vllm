@@ -7,27 +7,80 @@ import torch
 from tests.v1.attention.utils import create_vllm_config
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.mla import indexer
+from vllm.model_executor.layers import sparse_attn_indexer
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+from vllm.v1.attention.ops import rocm_triton_sparse_indexer
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 
 @pytest.mark.parametrize(
-    ("is_rocm", "on_gfx1151", "expected"),
+    ("is_rocm", "is_gfx1151", "expected"),
     [
         (True, True, AttentionCGSupport.NEVER),
         (True, False, AttentionCGSupport.UNIFORM_BATCH),
-        (False, True, AttentionCGSupport.UNIFORM_BATCH),
+        (False, False, AttentionCGSupport.UNIFORM_BATCH),
     ],
 )
-def test_indexer_cudagraph_support_excludes_gfx1151(
-    monkeypatch, is_rocm, on_gfx1151, expected
+def test_indexer_cudagraph_support_excludes_rocm_fallback(
+    monkeypatch, is_rocm, is_gfx1151, expected
 ):
     monkeypatch.setattr(indexer.current_platform, "is_rocm", lambda: is_rocm)
-    monkeypatch.setattr(indexer, "on_gfx1151", lambda: on_gfx1151, raising=False)
+    monkeypatch.setattr(
+        indexer.current_platform, "on_gfx1151", lambda: is_gfx1151
+    )
 
     support = DeepseekV32IndexerMetadataBuilder.get_cudagraph_support(None, None)
 
     assert support is expected
+
+
+@pytest.mark.parametrize(
+    ("is_rocm", "is_gfx1151", "expected"),
+    [
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+    ],
+)
+def test_rocm_triton_sparse_indexer_availability(
+    monkeypatch, is_rocm, is_gfx1151, expected
+):
+    monkeypatch.setattr(
+        rocm_triton_sparse_indexer.current_platform, "is_rocm", lambda: is_rocm
+    )
+    monkeypatch.setattr(
+        rocm_triton_sparse_indexer.current_platform,
+        "on_gfx1151",
+        lambda: is_gfx1151,
+    )
+
+    assert (
+        rocm_triton_sparse_indexer.is_rocm_triton_sparse_indexer_available()
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("fallback_available", "aiter_enabled", "expected"),
+    [
+        (True, False, True),
+        (True, True, False),
+        (False, False, False),
+    ],
+)
+def test_rocm_sparse_indexer_dispatch_preserves_aiter_priority(
+    monkeypatch, fallback_available, aiter_enabled, expected
+):
+    monkeypatch.setattr(
+        sparse_attn_indexer,
+        "is_rocm_triton_sparse_indexer_available",
+        lambda: fallback_available,
+    )
+    monkeypatch.setattr(
+        sparse_attn_indexer.rocm_aiter_ops, "is_enabled", lambda: aiter_enabled
+    )
+
+    assert sparse_attn_indexer.use_rocm_triton_sparse_indexer() is expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

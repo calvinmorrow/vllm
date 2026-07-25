@@ -36,13 +36,22 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.rocm_triton_sparse_indexer import (
-    is_gfx1151_triton_sparse_indexer_available,
+    is_rocm_triton_sparse_indexer_available,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+
+
+def use_rocm_triton_sparse_indexer() -> bool:
+    """Return whether to dispatch ROCm sparse indexing to the fallback path."""
+    return (
+        is_rocm_triton_sparse_indexer_available()
+        and not rocm_aiter_ops.is_enabled()
+    )
+
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -846,8 +855,8 @@ class SparseAttnIndexer(CustomOp):
                 self.topk_indices_buffer,
                 skip_k_cache_insert=self.skip_k_cache_insert,
             )
-        # gfx1151 Triton path: native top-k without AITER
-        if is_gfx1151_triton_sparse_indexer_available():
+        # Device-only stable-sort fallback when AITER is disabled.
+        if use_rocm_triton_sparse_indexer():
             return torch.ops.vllm.rocm_triton_sparse_attn_indexer(
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),
@@ -865,8 +874,6 @@ class SparseAttnIndexer(CustomOp):
                 skip_k_cache_insert=self.skip_k_cache_insert,
             )
         raise RuntimeError(
-            "Sparse attention indexer ROCm path requires AITER (MI300+) "
-            "or a verified gfx1151 device with Triton support. "
-            "For MI300+: set VLLM_ROCM_USE_AITER=1. "
-            "For gfx1151: ensure ROCm detects the correct architecture."
+            "Sparse attention indexer ROCm path requires a ROCm device with "
+            "the Triton score-producing path available."
         )
