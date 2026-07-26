@@ -30,6 +30,29 @@ def _enable_breakable_cudagraph(monkeypatch: pytest.MonkeyPatch):
     envs.disable_envs_cache()
 
 
+def test_breakable_cudagraph_diagnostics_aggregate_dispatches(monkeypatch):
+    import vllm.compilation.breakable_cudagraph_diagnostics as diagnostics_module
+
+    monkeypatch.setattr(
+        diagnostics_module.envs, "VLLM_BREAKABLE_CUDAGRAPH_DIAGNOSTICS", True
+    )
+    diagnostics = diagnostics_module.BreakableCUDAGraphDiagnostics()
+    monkeypatch.setattr(diagnostics_module.time, "monotonic", lambda: 0.0)
+
+    diagnostics.record_dispatch(1, 8, "FULL")
+    diagnostics.record("graph_replays")
+    diagnostics.record_duration_ms("mla_metadata_and_sync_ms", 0.001)
+
+    counters, durations, dispatches = diagnostics.snapshot()
+    assert counters == {
+        "dispatches": 1,
+        "graph_replays": 1,
+        "padding_tokens": 7,
+    }
+    assert durations == {"mla_metadata_and_sync_ms": 1.0}
+    assert dispatches == {"1->8:FULL": 1}
+
+
 def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
     from vllm.config import CUDAGraphMode
     from vllm.v1.worker.gpu.cudagraph_utils import (

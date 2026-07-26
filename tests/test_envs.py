@@ -17,6 +17,14 @@ from vllm.envs import (
 )
 
 
+def test_breakable_cudagraph_diagnostics_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("VLLM_BREAKABLE_CUDAGRAPH_DIAGNOSTICS", raising=False)
+    assert environment_variables["VLLM_BREAKABLE_CUDAGRAPH_DIAGNOSTICS"]() is False
+
+    monkeypatch.setenv("VLLM_BREAKABLE_CUDAGRAPH_DIAGNOSTICS", "1")
+    assert environment_variables["VLLM_BREAKABLE_CUDAGRAPH_DIAGNOSTICS"]() is True
+
+
 def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):
     assert envs.VLLM_HOST_IP == ""
     assert envs.VLLM_PORT is None

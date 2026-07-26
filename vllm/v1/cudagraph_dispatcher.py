@@ -4,6 +4,9 @@ from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
 
+from vllm.compilation.breakable_cudagraph_diagnostics import (
+    breakable_cudagraph_diagnostics,
+)
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
@@ -278,6 +281,10 @@ class CudagraphDispatcher:
             or num_tokens > max_size
             or allowed_modes <= {CUDAGraphMode.NONE}
         ):
+            if breakable_cudagraph_diagnostics.enabled:
+                breakable_cudagraph_diagnostics.record_dispatch(
+                    num_tokens, num_tokens, CUDAGraphMode.NONE.value
+                )
             return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
 
         effective_num_active_loras = num_active_loras
@@ -308,6 +315,12 @@ class CudagraphDispatcher:
             # check if key exists for full cudagraph
             batch_desc_to_check = batch_desc
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:
+                if breakable_cudagraph_diagnostics.enabled:
+                    breakable_cudagraph_diagnostics.record_dispatch(
+                        num_tokens,
+                        batch_desc_to_check.num_tokens,
+                        CUDAGraphMode.FULL.value,
+                    )
                 return CUDAGraphMode.FULL, batch_desc_to_check
 
         if CUDAGraphMode.PIECEWISE in allowed_modes:
@@ -315,12 +328,22 @@ class CudagraphDispatcher:
             # piecewise cudagraph
             batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
+                if breakable_cudagraph_diagnostics.enabled:
+                    breakable_cudagraph_diagnostics.record_dispatch(
+                        num_tokens,
+                        batch_desc_to_check.num_tokens,
+                        CUDAGraphMode.PIECEWISE.value,
+                    )
                 return CUDAGraphMode.PIECEWISE, batch_desc_to_check
 
         assert CUDAGraphMode.NONE in allowed_modes, (
             f"No matching cudagraph found and NONE is not in "
             f"allowed_modes={allowed_modes}"
         )
+        if breakable_cudagraph_diagnostics.enabled:
+            breakable_cudagraph_diagnostics.record_dispatch(
+                num_tokens, num_tokens, CUDAGraphMode.NONE.value
+            )
         return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
 
     def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:

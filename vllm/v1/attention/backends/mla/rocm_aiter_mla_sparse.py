@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -9,6 +10,9 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.compilation.breakable_cudagraph_diagnostics import (
+    breakable_cudagraph_diagnostics,
+)
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -562,6 +566,12 @@ class ROCMAiterMLASparseMetadataBuilder(
             seg_lengths.tobytes(),
         )
         if metadata_key != self._prev_metadata_key:
+            metadata_start_time = (
+                time.monotonic() if breakable_cudagraph_diagnostics.enabled else None
+            )
+            if breakable_cudagraph_diagnostics.enabled:
+                breakable_cudagraph_diagnostics.record("mla_metadata_rebuilds")
+                breakable_cudagraph_diagnostics.record("mla_metadata_syncs")
             from aiter import get_mla_metadata_v1
 
             max_split_per_batch = self._sparse_decode_max_split(
@@ -590,7 +600,14 @@ class ROCMAiterMLASparseMetadataBuilder(
             # The persistent metadata buffers are read by graph replay. Order
             # the async metadata write before the graph-captured decode kernel.
             torch.cuda.current_stream(self.device).synchronize()
+            if metadata_start_time is not None:
+                breakable_cudagraph_diagnostics.record_duration_ms(
+                    "mla_metadata_and_sync_ms",
+                    time.monotonic() - metadata_start_time,
+                )
             self._prev_metadata_key = metadata_key
+        elif breakable_cudagraph_diagnostics.enabled:
+            breakable_cudagraph_diagnostics.record("mla_metadata_cache_hits")
 
         metadata = ROCMAiterMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,

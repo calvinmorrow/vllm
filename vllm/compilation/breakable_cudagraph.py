@@ -33,6 +33,9 @@ from typing import Any, ClassVar, TypeVar
 import torch
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph_diagnostics import (
+    breakable_cudagraph_diagnostics,
+)
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
@@ -320,6 +323,8 @@ class BreakableCUDAGraphWrapper:
         # vs FULL, so we match either. Entries are keyed by batch
         # descriptor, which already encodes prefill/decode distinctions.
         if cudagraph_runtime_mode == CUDAGraphMode.NONE:
+            if breakable_cudagraph_diagnostics.enabled:
+                breakable_cudagraph_diagnostics.record("eager_fallbacks")
             return self.runnable(*args, **kwargs)
 
         assert batch_descriptor is not None
@@ -393,6 +398,14 @@ class BreakableCUDAGraphWrapper:
 
         entry.capture = capture
         entry.output = weak_ref_tensors(output)
+        if breakable_cudagraph_diagnostics.enabled:
+            breakable_cudagraph_diagnostics.record("graph_captures")
+            breakable_cudagraph_diagnostics.record(
+                "captured_graph_segments", capture.num_graphs
+            )
+            breakable_cudagraph_diagnostics.record(
+                "captured_eager_breaks", capture.num_eager_breaks
+            )
 
         logger.debug(
             "Captured breakable cudagraph for %s: %r",
@@ -421,4 +434,12 @@ class BreakableCUDAGraphWrapper:
         get_offloader().sync_prev_onload()
         assert entry.capture is not None
         entry.capture.replay()
+        if breakable_cudagraph_diagnostics.enabled:
+            breakable_cudagraph_diagnostics.record("graph_replays")
+            breakable_cudagraph_diagnostics.record(
+                "replayed_graph_segments", entry.capture.num_graphs
+            )
+            breakable_cudagraph_diagnostics.record(
+                "replayed_eager_breaks", entry.capture.num_eager_breaks
+            )
         return entry.output
