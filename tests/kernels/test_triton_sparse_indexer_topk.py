@@ -75,6 +75,31 @@ class TestSparseIndexerStableTopk:
         )
         torch.testing.assert_close(result, expected)
 
+    def test_stable_sort_capture_replay_matches_eager(self):
+        from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
+            triton_sparse_indexer_topk,
+        )
+
+        width, top_k = 8192, 512
+        captured_scores = (
+            (torch.arange(width, device="cuda") % 8).flip(0).float()[None, :]
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_result = triton_sparse_indexer_topk(captured_scores, top_k)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected = triton_sparse_indexer_topk(captured_scores, top_k)
+        torch.testing.assert_close(captured_result, expected)
+
+        captured_scores.copy_(captured_scores.roll(1, dims=1))
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected = triton_sparse_indexer_topk(captured_scores, top_k)
+        torch.testing.assert_close(captured_result, expected)
+
     def test_stable_sort_microbenchmark_correctness(self):
         """Exercise stable sort at target width without a flaky time threshold."""
         from vllm.v1.attention.ops.triton_sparse_indexer_topk import (

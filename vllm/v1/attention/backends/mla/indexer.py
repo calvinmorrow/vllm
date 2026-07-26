@@ -465,12 +465,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
-        from vllm.v1.attention.ops.rocm_triton_sparse_indexer import (
-            is_rocm_triton_sparse_indexer_available,
-        )
-
-        if is_rocm_triton_sparse_indexer_available():
-            return AttentionCGSupport.NEVER
         return AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, *args, **kwargs):

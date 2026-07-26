@@ -6,32 +6,16 @@ import torch
 
 from tests.v1.attention.utils import create_vllm_config
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
-from vllm.v1.attention.backends.mla import indexer
 from vllm.model_executor.layers import sparse_attn_indexer
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.attention.ops import rocm_triton_sparse_indexer
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 
-@pytest.mark.parametrize(
-    ("is_rocm", "is_gfx1151", "expected"),
-    [
-        (True, True, AttentionCGSupport.NEVER),
-        (True, False, AttentionCGSupport.UNIFORM_BATCH),
-        (False, False, AttentionCGSupport.UNIFORM_BATCH),
-    ],
-)
-def test_indexer_cudagraph_support_excludes_rocm_fallback(
-    monkeypatch, is_rocm, is_gfx1151, expected
-):
-    monkeypatch.setattr(indexer.current_platform, "is_rocm", lambda: is_rocm)
-    monkeypatch.setattr(
-        indexer.current_platform, "on_gfx1151", lambda: is_gfx1151
-    )
-
+def test_indexer_cudagraph_support_allows_uniform_batches():
     support = DeepseekV32IndexerMetadataBuilder.get_cudagraph_support(None, None)
 
-    assert support is expected
+    assert support is AttentionCGSupport.UNIFORM_BATCH
 
 
 @pytest.mark.parametrize(
