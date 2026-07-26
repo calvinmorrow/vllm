@@ -118,3 +118,145 @@ class TestSparseIndexerStableTopk:
 
         _, expected = torch.sort(scores, dim=-1, descending=True, stable=True)
         torch.testing.assert_close(result, expected[:, :top_k].to(torch.int32))
+
+
+def _make_paged_mqa_inputs() -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        indexer_k_quant_and_cache_triton,
+    )
+
+    torch.manual_seed(0)
+    batch_size, block_size, max_model_len = 2, 64, 128
+    num_blocks = 4
+    kv_cache = torch.zeros(
+        (num_blocks, block_size, 132), dtype=torch.uint8, device="cuda"
+    )
+    block_tables = torch.tensor(
+        [[2, 0], [3, 1]], dtype=torch.int32, device="cuda"
+    )
+    context_lens = torch.tensor([70, 33], dtype=torch.int32, device="cuda")
+    slot_mapping = torch.cat(
+        (
+            torch.cat(
+                (
+                    torch.arange(64, device="cuda") + 2 * block_size,
+                    torch.arange(6, device="cuda"),
+                )
+            ),
+            torch.arange(33, device="cuda") + 3 * block_size,
+        )
+    ).to(torch.int64)
+    k = torch.randn(103, 128, dtype=torch.bfloat16, device="cuda") * 0.125
+    indexer_k_quant_and_cache_triton(
+        k, kv_cache, slot_mapping, quant_block_size=128, scale_fmt="dynamic"
+    )
+    q = (torch.randn(batch_size, 1, 64, 128, device="cuda") * 0.125).to(
+        torch.float8_e4m3fnuz
+    )
+    weights = torch.rand(batch_size, 64, dtype=torch.float32, device="cuda")
+    return q, kv_cache.unsqueeze(-2), weights, context_lens, block_tables
+
+
+def _paged_mqa_logits_reference(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    block_size, head_dim = cache.shape[1], q.shape[-1]
+    cache_flat = cache.squeeze(-2).view(cache.shape[0], -1)
+    values = cache_flat[:, : block_size * head_dim].view(q.dtype)
+    scales = cache_flat[:, block_size * head_dim :].view(torch.float32)
+    logits = torch.full(
+        (q.shape[0], max_model_len), float("-inf"), dtype=torch.float32, device=q.device
+    )
+    dims = torch.arange(head_dim, device=q.device)
+    for batch in range(q.shape[0]):
+        context_len = int(context_lens[batch])
+        positions = torch.arange(context_len, device=q.device)
+        blocks = block_tables[batch, positions // block_size].long()
+        offsets = (
+            (positions[:, None] % block_size // 16) * (16 * head_dim)
+            + (positions[:, None] % 16) * 16
+            + (dims[None, :] // 16) * (16 * 16)
+            + dims[None, :] % 16
+        )
+        keys = values[blocks[:, None], offsets].float()
+        scores = torch.relu(keys @ q[batch, 0].float().T) * weights[batch]
+        logits[batch, :context_len] = scores.sum(dim=1) * scales[blocks, positions % block_size]
+    return logits
+
+
+class TestTritonPagedMqaLogits:
+    def test_matches_torch_reference_with_paged_shuffled_cache(self):
+        from vllm.v1.attention.ops.triton_fp8_paged_mqa_logits import (
+            triton_fp8_paged_mqa_logits_gfx1151,
+        )
+        from vllm.v1.worker.workspace import (
+            init_workspace_manager,
+            reset_workspace_manager,
+        )
+
+        q, cache, weights, context_lens, block_tables = _make_paged_mqa_inputs()
+        reset_workspace_manager()
+        init_workspace_manager(torch.device("cuda"))
+        actual = triton_fp8_paged_mqa_logits_gfx1151(
+            q, cache, weights, context_lens, block_tables, max_model_len=128
+        ).clone()
+        expected = _paged_mqa_logits_reference(
+            q, cache, weights, context_lens, block_tables, max_model_len=128
+        )
+
+        valid = torch.arange(128, device="cuda")[None, :] < context_lens[:, None]
+        torch.testing.assert_close(actual[valid], expected[valid], atol=2e-2, rtol=2e-2)
+        assert torch.isneginf(actual[~valid]).all()
+        reset_workspace_manager()
+
+    def test_cuda_graph_replay_matches_eager(self):
+        from vllm.v1.attention.ops.triton_fp8_paged_mqa_logits import (
+            triton_fp8_paged_mqa_logits_gfx1151,
+        )
+        from vllm.v1.worker.workspace import (
+            current_workspace_manager,
+            init_workspace_manager,
+            reset_workspace_manager,
+        )
+
+        q, cache, weights, context_lens, block_tables = _make_paged_mqa_inputs()
+        reset_workspace_manager()
+        init_workspace_manager(torch.device("cuda"))
+        eager = triton_fp8_paged_mqa_logits_gfx1151(
+            q, cache, weights, context_lens, block_tables, max_model_len=128
+        ).clone()
+        current_workspace_manager().lock()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = triton_fp8_paged_mqa_logits_gfx1151(
+                q, cache, weights, context_lens, block_tables, max_model_len=128
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(captured, eager)
+        captured_ptr = captured.data_ptr()
+
+        q_bytes = q.view(torch.uint8)
+        q_bytes.copy_(q_bytes.roll(1, dims=2))
+        expected = _paged_mqa_logits_reference(
+            q, cache, weights, context_lens, block_tables, max_model_len=128
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert captured.data_ptr() == captured_ptr
+        torch.testing.assert_close(captured, expected, atol=2e-2, rtol=2e-2)
+        reset_workspace_manager()

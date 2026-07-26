@@ -463,10 +463,23 @@ def rocm_fp8_paged_mqa_logits(
             ChunkQ=heads,
         )
         return out_qk.sum(dim=0)
-    else:
-        return fp8_paged_mqa_logits_torch(
-            q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
+    if current_platform.on_gfx1151():
+        from vllm.v1.attention.ops.triton_fp8_paged_mqa_logits import (
+            triton_fp8_paged_mqa_logits_gfx1151,
         )
+
+        return triton_fp8_paged_mqa_logits_gfx1151(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
+
+    return fp8_paged_mqa_logits_torch(
+        q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
+    )
 
 
 # Take from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L84
