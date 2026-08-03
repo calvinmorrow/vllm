@@ -222,15 +222,16 @@ def rocm_triton_sparse_attn_indexer(
         )
 
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
-        # Output and scratch are caller-owned. Map padded decode rows to their
-        # source sequence in the Triton kernel to avoid repeat_interleave.
+        # Decode metadata stores one length per padded token as a contiguous
+        # [batch_size, next_n] tensor. The selector accepts a rank-1 view;
+        # view() preserves its capture-stable storage and never allocates.
+        topk_seq_lens = decode_metadata.seq_lens.view(-1)
         triton_sparse_indexer_topk_decode(
             logits,
-            decode_metadata.seq_lens,
+            topk_seq_lens,
             topk_tokens,
             topk_indices,
             topk_scratch,
-            repeats=next_n,
         )
 
         if decode_metadata.requires_padding:
