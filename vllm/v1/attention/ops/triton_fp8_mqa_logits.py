@@ -86,17 +86,7 @@ def _fp8_mqa_logits_kernel(
 
     logits_row_ptrs = logits_ptr + row_id * stride_logits_s
 
-    h_inds = tl.arange(0, NUM_HEADS)[:, None]
     d_inds = tl.arange(0, HEAD_SIZE)
-
-    # load Q[BLOCK_Q, NUM_HEADS, HEAD_SIZE]
-    q_ptrs = (
-        Q_ptr + row_id * stride_q_s + h_inds * stride_q_h + d_inds[None, :] * stride_q_d
-    )
-
-    q_block = tl.load(q_ptrs, cache_modifier=".cg")
-    w_ptrs = weights_ptr + row_id * stride_w_s + h_inds * stride_w_h
-    w_block = tl.load(w_ptrs, cache_modifier=".cg").to(tl.float32)
 
     # Load start/end for each row in this block
     start_ind = tl.load(cu_start_ptr + row_id)
@@ -121,15 +111,19 @@ def _fp8_mqa_logits_kernel(
         kv_block = tl.load(kv_ptrs)
         kv_scales = tl.load(kv_scales_ptrs)
 
-        # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-        scores = tl.dot(q_block, kv_block, input_precision="ieee")
-        # Multiply by kv_scales (broadcast along rows)
-        scores = scores * kv_scales[None, :]
-        # ReLU
-        scores = tl.maximum(scores, 0.0)
-        scores = scores * w_block
-        # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
-        scores = tl.sum(scores, axis=0)
+        kv_block_f32 = kv_block.to(tl.float32)
+        scores = tl.zeros((BLOCK_KV,), dtype=tl.float32)
+        for h in tl.static_range(0, NUM_HEADS):
+            q_head = tl.load(
+                Q_ptr + row_id * stride_q_s + h * stride_q_h + d_inds * stride_q_d,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+            head_scores = tl.sum(q_head[:, None] * kv_block_f32, axis=0)
+            weight = tl.load(
+                weights_ptr + row_id * stride_w_s + h * stride_w_h,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+            scores += tl.maximum(head_scores * kv_scales, 0.0) * weight
         tl.store(logits_ptrs, scores)
 
         kv_ptrs += BLOCK_KV * stride_kv_s
@@ -142,15 +136,19 @@ def _fp8_mqa_logits_kernel(
     kv_block = tl.load(kv_ptrs, mask=kv_col_mask[None, :], other=0.0)
     kv_scales = tl.load(kv_scales_ptrs, mask=kv_col_mask, other=0.0)
 
-    # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-    scores = tl.dot(q_block, kv_block, input_precision="ieee")
-    # Multiply by kv_scales (broadcast along rows)
-    scores = scores * kv_scales[None, :]
-    # ReLU
-    scores = tl.maximum(scores, 0.0)
-    scores = scores * w_block
-    # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
-    scores = tl.sum(scores, axis=0)
+    kv_block_f32 = kv_block.to(tl.float32)
+    scores = tl.zeros((BLOCK_KV,), dtype=tl.float32)
+    for h in tl.static_range(0, NUM_HEADS):
+        q_head = tl.load(
+            Q_ptr + row_id * stride_q_s + h * stride_q_h + d_inds * stride_q_d,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        head_scores = tl.sum(q_head[:, None] * kv_block_f32, axis=0)
+        weight = tl.load(
+            weights_ptr + row_id * stride_w_s + h * stride_w_h,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        scores += tl.maximum(head_scores * kv_scales, 0.0) * weight
     # masked store
     in_window = (kv_col_offsets >= start_ind) & (kv_col_offsets < end_ind)
     tl.store(logits_ptrs, scores, mask=in_window)
@@ -237,11 +235,6 @@ def triton_fp8_mqa_logits(
         block_kv = 64
         num_stages = 1
 
-    # heuristic for MFMA instruction shape, identical to AITER's choice
-    matrix_instr_nonkdim = 32
-    if seq_len <= 1024:
-        matrix_instr_nonkdim = 16
-
     stride_q_s, stride_q_h, stride_q_d = q.stride()
     stride_kv_s, stride_kv_d = k_fp8.stride()
     stride_w_s, stride_w_h = weights.stride()
@@ -272,7 +265,6 @@ def triton_fp8_mqa_logits(
         num_warps=4,
         num_stages=num_stages,
         waves_per_eu=2,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
     )
 
     return logits
