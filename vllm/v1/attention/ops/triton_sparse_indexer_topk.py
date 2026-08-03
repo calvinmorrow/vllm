@@ -163,7 +163,7 @@ def _sparse_indexer_chunk_select_kernel(
     selected = tl.bitonic_merge(selected, descending=True)
     if candidate_k > local_k:
         padding = tl.full((candidate_k - local_k,), sentinel, tl.int64)
-        selected = tl.cat(selected, padding)
+        selected = tl.cat(selected, padding, can_reorder=True)
 
     ranks = tl.arange(0, candidate_k)
     offsets = (
@@ -210,7 +210,9 @@ def _sparse_indexer_merge_kernel(
     ).to(tl.int64, bitcast=True)
     left = tl.where(has_left, left, sentinel)
     right = tl.where(has_right, right, sentinel)
-    selected = tl.topk(tl.cat(left, right), candidate_k)
+    selected = tl.topk(
+        tl.cat(left, right, can_reorder=True), candidate_k
+    )
     selected = tl.bitonic_merge(selected, descending=True)
     offsets = (
         row * destination_row_stride
