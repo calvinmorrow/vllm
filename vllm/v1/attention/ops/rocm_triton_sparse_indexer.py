@@ -30,8 +30,102 @@ def is_rocm_triton_sparse_indexer_available() -> bool:
     return current_platform.is_rocm() and current_platform.on_gfx1151()
 
 
-@eager_break_during_capture
 def rocm_triton_sparse_attn_indexer(
+    hidden_states: torch.Tensor,
+    k_cache_prefix: LayerNameType,
+    kv_cache: torch.Tensor,
+    q_fp8: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: str | None,
+    topk_tokens: int,
+    head_dim: int,
+    max_model_len: int,
+    total_seq_lens: int,
+    topk_indices_buffer: torch.Tensor | None,
+    skip_k_cache_insert: bool = False,
+) -> torch.Tensor:
+    """Dispatch the capture-safe decode path or a narrow eager fallback."""
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, dict):
+        k_cache_prefix = _resolve_layer_name(k_cache_prefix)
+        layer_attn_metadata = attn_metadata[k_cache_prefix]
+        assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
+        if layer_attn_metadata.num_prefills or (
+            layer_attn_metadata.decode is not None
+            and layer_attn_metadata.decode.requires_padding
+        ):
+            return _rocm_triton_sparse_attn_indexer_eager_fallback(
+                hidden_states,
+                k_cache_prefix,
+                kv_cache,
+                q_fp8,
+                k,
+                weights,
+                quant_block_size,
+                scale_fmt,
+                topk_tokens,
+                head_dim,
+                max_model_len,
+                total_seq_lens,
+                topk_indices_buffer,
+                skip_k_cache_insert,
+            )
+    return _rocm_triton_sparse_attn_indexer_impl(
+        hidden_states,
+        k_cache_prefix,
+        kv_cache,
+        q_fp8,
+        k,
+        weights,
+        quant_block_size,
+        scale_fmt,
+        topk_tokens,
+        head_dim,
+        max_model_len,
+        total_seq_lens,
+        topk_indices_buffer,
+        skip_k_cache_insert,
+    )
+
+
+@eager_break_during_capture
+def _rocm_triton_sparse_attn_indexer_eager_fallback(
+    hidden_states: torch.Tensor,
+    k_cache_prefix: LayerNameType,
+    kv_cache: torch.Tensor,
+    q_fp8: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: str | None,
+    topk_tokens: int,
+    head_dim: int,
+    max_model_len: int,
+    total_seq_lens: int,
+    topk_indices_buffer: torch.Tensor | None,
+    skip_k_cache_insert: bool = False,
+) -> torch.Tensor:
+    return _rocm_triton_sparse_attn_indexer_impl(
+        hidden_states,
+        k_cache_prefix,
+        kv_cache,
+        q_fp8,
+        k,
+        weights,
+        quant_block_size,
+        scale_fmt,
+        topk_tokens,
+        head_dim,
+        max_model_len,
+        total_seq_lens,
+        topk_indices_buffer,
+        skip_k_cache_insert,
+    )
+
+
+def _rocm_triton_sparse_attn_indexer_impl(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
     kv_cache: torch.Tensor,
