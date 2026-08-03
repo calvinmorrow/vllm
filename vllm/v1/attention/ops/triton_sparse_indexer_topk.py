@@ -6,9 +6,9 @@ Scores are selected in 1024-column chunks, then reduced by pairwise merges.
 The caller provides two uint64 scratch planes; each stores packed sortable keys
 with shape ``[rows, chunks, candidate_k]``. Thus scratch is bounded by
 ``2 * rows * ceil(width / 1024) * next_power_of_two(top_k)`` uint64 elements.
-The implementation supports widths through ``MAX_WIDTH`` and top-k values
-through ``MAX_TOP_K``. It never allocates or aliases scores on the selected
-path.
+The implementation supports any positive score width whose caller-provided
+scratch has sufficient capacity, and top-k values through ``MAX_TOP_K``. It
+never allocates or aliases scores on the selected path.
 """
 
 import torch
@@ -16,7 +16,6 @@ import torch
 from vllm.triton_utils import tl, triton
 
 CHUNK_WIDTH = 1024
-MAX_WIDTH = 16384
 MAX_TOP_K = 2048
 _SENTINEL = -9223372036854775808
 
@@ -44,12 +43,8 @@ def sparse_indexer_topk_scratch_shape(
     """
     if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
         raise RuntimeError("rows must be a non-negative integer")
-    if (
-        isinstance(width, bool)
-        or not isinstance(width, int)
-        or not 0 < width <= MAX_WIDTH
-    ):
-        raise RuntimeError(f"score width must be in [1, {MAX_WIDTH}]")
+    if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+        raise RuntimeError("score width must be a positive integer")
     if (
         isinstance(top_k, bool)
         or not isinstance(top_k, int)
@@ -130,6 +125,8 @@ def _sparse_indexer_chunk_select_kernel(
     score_stride,
     scratch_row_stride,
     scratch_chunk_stride,
+    chunk_width: tl.constexpr,
+    sentinel: tl.constexpr,
     repeats: tl.constexpr,
     candidate_k: tl.constexpr,
     local_k: tl.constexpr,
@@ -137,7 +134,7 @@ def _sparse_indexer_chunk_select_kernel(
 ):
     row = tl.program_id(0)
     chunk = tl.program_id(1)
-    cols = chunk * CHUNK_WIDTH + tl.arange(0, CHUNK_WIDTH)
+    cols = chunk * chunk_width + tl.arange(0, chunk_width)
     scores = tl.load(
         scores_ptr + row * score_stride + cols,
         mask=cols < width,
@@ -161,11 +158,11 @@ def _sparse_indexer_chunk_select_kernel(
         (~bits) & 0xFFFFFFFF,
         bits ^ 0x80000000,
     )
-    key = ((ordered << 32) | (0xFFFFFFFF - cols.to(tl.int64))) ^ _SENTINEL
-    selected = tl.topk(tl.where(valid, key, _SENTINEL), local_k)
+    key = ((ordered << 32) | (0xFFFFFFFF - cols.to(tl.int64))) ^ sentinel
+    selected = tl.topk(tl.where(valid, key, sentinel), local_k)
     selected = tl.bitonic_merge(selected, descending=True)
     if candidate_k > local_k:
-        padding = tl.full((candidate_k - local_k,), _SENTINEL, tl.int64)
+        padding = tl.full((candidate_k - local_k,), sentinel, tl.int64)
         selected = tl.cat(selected, padding)
 
     ranks = tl.arange(0, candidate_k)
@@ -185,6 +182,7 @@ def _sparse_indexer_merge_kernel(
     destination_row_stride,
     destination_chunk_stride,
     source_chunks,
+    sentinel: tl.constexpr,
     candidate_k: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -210,8 +208,8 @@ def _sparse_indexer_merge_kernel(
         mask=has_right,
         other=0,
     ).to(tl.int64, bitcast=True)
-    left = tl.where(has_left, left, _SENTINEL)
-    right = tl.where(has_right, right, _SENTINEL)
+    left = tl.where(has_left, left, sentinel)
+    right = tl.where(has_right, right, sentinel)
     selected = tl.topk(tl.cat(left, right), candidate_k)
     selected = tl.bitonic_merge(selected, descending=True)
     offsets = (
@@ -235,6 +233,7 @@ def _sparse_indexer_write_kernel(
     width,
     top_k: tl.constexpr,
     candidate_k: tl.constexpr,
+    sentinel: tl.constexpr,
     validity_mode: tl.constexpr,
     starts_ptr,
 ):
@@ -246,7 +245,7 @@ def _sparse_indexer_write_kernel(
         tl.int64, bitcast=True
     )
     columns = (0xFFFFFFFF - (keys & 0xFFFFFFFF)).to(tl.int32)
-    values = tl.where(keys != _SENTINEL, columns, -1)
+    values = tl.where(keys != sentinel, columns, -1)
     if validity_mode == 2:
         start = tl.minimum(tl.maximum(tl.load(starts_ptr + row), 0), width)
         values = tl.where(values >= 0, values - start.to(tl.int32), values)
@@ -312,6 +311,8 @@ def _device_topk(
         scores.stride(0),
         row_stride,
         candidate_k,
+        chunk_width=CHUNK_WIDTH,
+        sentinel=_SENTINEL,
         repeats=repeats,
         candidate_k=candidate_k,
         local_k=local_k,
@@ -333,6 +334,7 @@ def _device_topk(
             row_stride,
             candidate_k,
             source_chunks,
+            sentinel=_SENTINEL,
             candidate_k=candidate_k,
             num_warps=4,
         )
@@ -348,6 +350,7 @@ def _device_topk(
         width,
         top_k=top_k,
         candidate_k=candidate_k,
+        sentinel=_SENTINEL,
         validity_mode=validity_mode,
         starts_ptr=starts if starts is not None else scratch,
         num_warps=4,

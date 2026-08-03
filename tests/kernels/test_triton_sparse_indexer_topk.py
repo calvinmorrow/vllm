@@ -65,6 +65,7 @@ def test_scratch_shape_validates_static_arguments() -> None:
     assert sparse_indexer_topk_scratch_shape(0, 1, 1) == (2, 0, 1, 1)
     assert sparse_indexer_topk_scratch_shape(3, 2049, 513) == (2, 3, 3, 1024)
     assert sparse_indexer_topk_scratch_numel(3, 2049, 513) == 18_432
+    assert sparse_indexer_topk_scratch_shape(1, 16_385, 1) == (2, 1, 17, 1)
     with pytest.raises(RuntimeError, match="score width"):
         sparse_indexer_topk_scratch_shape(1, 0, 1)
     with pytest.raises(RuntimeError, match="top_k"):
@@ -110,6 +111,21 @@ class TestSparseIndexerDeviceTopk:
         )
         torch.testing.assert_close(result, _reference(scores, top_k))
         assert result[0, -1].item() == 1279
+
+    def test_width_above_16384_matches_reference(self):
+        from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
+            triton_sparse_indexer_topk,
+        )
+
+        width, top_k = 16_385, 4
+        scores = torch.zeros((1, width), device="cuda", dtype=torch.float32)
+        scores[0, torch.tensor([1, 1024, 16_384], device="cuda")] = torch.tensor(
+            [1.0, 2.0, 3.0], device="cuda"
+        )
+        result = triton_sparse_indexer_topk(
+            scores, top_k, _output(1, top_k), _scratch(1, width, top_k)
+        )
+        torch.testing.assert_close(result, _reference(scores, top_k))
 
     def test_decode_clamps_prefixes_excludes_nonfinite_and_pads(self):
         from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
