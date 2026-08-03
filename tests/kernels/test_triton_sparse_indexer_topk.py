@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Focused GPU tests for sparse-indexer stable top-k fallback."""
+"""Focused GPU tests for the sparse-indexer device-only top-k selector."""
 
 import pytest
 import torch
 
 from vllm.platforms import current_platform
 
-
-pytestmark = pytest.mark.skipif(
+_requires_gfx1151 = pytest.mark.skipif(
     not (current_platform.is_rocm() and current_platform.on_gfx1151()),
     reason="requires ROCm gfx1151",
 )
@@ -18,107 +17,193 @@ def _device_tensor(values: list[list[float]]) -> torch.Tensor:
     return torch.tensor(values, device="cuda", dtype=torch.float32)
 
 
-class TestSparseIndexerStableTopk:
-    def test_stable_ties_choose_lower_indices_first(self):
+def _output(rows: int, top_k: int) -> torch.Tensor:
+    return torch.empty((rows, top_k), device="cuda", dtype=torch.int32)
+
+
+def _scratch(rows: int, width: int, top_k: int) -> torch.Tensor:
+    from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
+        sparse_indexer_topk_scratch_shape,
+    )
+
+    return torch.empty(
+        sparse_indexer_topk_scratch_shape(rows, width, top_k),
+        device="cuda",
+        dtype=torch.uint64,
+    )
+
+
+def _reference(
+    scores: torch.Tensor,
+    top_k: int,
+    starts: torch.Tensor | None = None,
+    ends: torch.Tensor | None = None,
+) -> torch.Tensor:
+    from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
+        _stable_topk_reference,
+    )
+
+    columns = torch.arange(scores.shape[1], device=scores.device)
+    valid = None
+    if starts is not None:
+        assert ends is not None
+        starts = starts.clamp(0, scores.shape[1])
+        ends = ends.clamp(0, scores.shape[1])
+        ends = torch.maximum(ends, starts)
+        valid = (columns[None, :] >= starts[:, None]) & (
+            columns[None, :] < ends[:, None]
+        )
+    return _stable_topk_reference(scores, top_k, valid)
+
+
+def test_scratch_shape_validates_static_arguments() -> None:
+    from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
+        sparse_indexer_topk_scratch_numel,
+        sparse_indexer_topk_scratch_shape,
+    )
+
+    assert sparse_indexer_topk_scratch_shape(0, 1, 1) == (2, 0, 1, 1)
+    assert sparse_indexer_topk_scratch_shape(3, 2049, 513) == (2, 3, 3, 1024)
+    assert sparse_indexer_topk_scratch_numel(3, 2049, 513) == 18_432
+    with pytest.raises(RuntimeError, match="score width"):
+        sparse_indexer_topk_scratch_shape(1, 0, 1)
+    with pytest.raises(RuntimeError, match="top_k"):
+        sparse_indexer_topk_scratch_shape(1, 1, 0)
+
+
+@_requires_gfx1151
+class TestSparseIndexerDeviceTopk:
+    def test_ties_across_selector_width_and_signed_zero_match_reference(self):
         from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
             triton_sparse_indexer_topk,
         )
 
-        result = triton_sparse_indexer_topk(_device_tensor([[2, 3, 3, 3, 1]]), 5)
-        expected = torch.tensor([[1, 2, 3, 0, 4]], device="cuda", dtype=torch.int32)
-        torch.testing.assert_close(result, expected)
+        width, top_k = 2048, 512
+        scores = (torch.arange(width, device="cuda") % 7).flip(0).float()[None, :]
+        scores[0, 600] = 4.0
+        scores[0, 1700] = 4.0
+        scores[0, 100] = 0.0
+        scores[0, 1100] = -0.0
+        out = _output(1, top_k)
+        result = triton_sparse_indexer_topk(
+            scores, top_k, out, _scratch(1, width, top_k)
+        )
+        assert result.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(result, _reference(scores, top_k))
 
-    def test_decode_masks_high_scores_outside_each_row_bound(self):
+    def test_ties_at_global_512_boundary_across_1024_chunks(self):
+        from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
+            triton_sparse_indexer_topk,
+        )
+
+        width, top_k = 2048, 512
+        scores = torch.zeros((1, width), device="cuda", dtype=torch.float32)
+        tied_columns = torch.cat(
+            (
+                torch.arange(256, device="cuda"),
+                torch.arange(1024, 1281, device="cuda"),
+            )
+        )
+        scores[0, tied_columns] = 1.0
+        result = triton_sparse_indexer_topk(
+            scores, top_k, _output(1, top_k), _scratch(1, width, top_k)
+        )
+        torch.testing.assert_close(result, _reference(scores, top_k))
+        assert result[0, -1].item() == 1279
+
+    def test_decode_clamps_prefixes_excludes_nonfinite_and_pads(self):
         from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
             triton_sparse_indexer_topk_decode,
         )
 
-        scores = _device_tensor([[1, 4, 99, 98], [5, 2, 8, 99]])
-        lengths = torch.tensor([2, 3], device="cuda")
-        result = triton_sparse_indexer_topk_decode(scores, lengths, top_k=4)
-        expected = torch.tensor(
-            [[1, 0, -1, -1], [2, 0, 1, -1]],
-            device="cuda",
-            dtype=torch.int32,
+        scores = _device_tensor(
+            [[1, 4, 99, float("inf")], [5, float("nan"), 8, float("-inf")]]
+        )
+        lengths = torch.tensor([-2, 99], device="cuda", dtype=torch.int32)
+        out = _output(2, 6)
+        result = triton_sparse_indexer_topk_decode(
+            scores, lengths, 6, out, _scratch(2, 4, 6)
+        )
+        expected = _reference(
+            scores,
+            6,
+            torch.zeros_like(lengths),
+            lengths,
         )
         torch.testing.assert_close(result, expected)
 
-    def test_prefill_masks_high_scores_outside_span_before_selection(self):
+    def test_decode_repeated_rows_uses_source_sequence_bounds(self):
+        from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
+            triton_sparse_indexer_topk_decode,
+        )
+
+        scores = _device_tensor(
+            [[1, 5, 9, 8], [2, 4, 7, 6], [3, 8, 1, 0], [9, 2, 1, 0]]
+        )
+        lengths = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
+        out = _output(4, 4)
+        result = triton_sparse_indexer_topk_decode(
+            scores, lengths, 4, out, _scratch(4, 4, 4), repeats=2
+        )
+        expected = _reference(
+            scores,
+            4,
+            torch.zeros(4, device="cuda", dtype=torch.int32),
+            lengths.repeat_interleave(2),
+        )
+        torch.testing.assert_close(result, expected)
+
+    def test_prefill_clamps_spans_and_returns_row_local_indices(self):
         from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
             triton_sparse_indexer_topk_prefill,
         )
 
         scores = _device_tensor([[99, 98, 3, 1, 4, 2, 97], [1, 3, 2, 96, 95, 94, 93]])
-        starts = torch.tensor([2, 0], device="cuda")
-        ends = torch.tensor([6, 3], device="cuda")
-        result = triton_sparse_indexer_topk_prefill(scores, starts, ends, top_k=5)
-        expected = torch.tensor(
-            [[2, 0, 3, 1, -1], [1, 2, 0, -1, -1]],
-            device="cuda",
-            dtype=torch.int32,
+        starts = torch.tensor([2, 5], device="cuda", dtype=torch.int32)
+        ends = torch.tensor([6, -3], device="cuda", dtype=torch.int32)
+        out = _output(2, 8)
+        result = triton_sparse_indexer_topk_prefill(
+            scores, starts, ends, 8, out, _scratch(2, 7, 8)
+        )
+        expected = _reference(scores, 8, starts, ends)
+        clamped_starts = starts.clamp(0, scores.shape[1])
+        expected = torch.where(
+            expected >= 0, expected - clamped_starts[:, None], expected
         )
         torch.testing.assert_close(result, expected)
 
-    def test_nonfinite_scores_are_padding(self):
+    def test_output_capacity_is_validated(self):
         from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
             triton_sparse_indexer_topk,
         )
 
-        scores = _device_tensor(
-            [[3, float("nan"), 1, float("inf"), float("-inf"), 3]]
-        )
-        result = triton_sparse_indexer_topk(scores, top_k=7)
-        expected = torch.tensor(
-            [[0, 5, 2, -1, -1, -1, -1]],
-            device="cuda",
-            dtype=torch.int32,
-        )
-        torch.testing.assert_close(result, expected)
+        with pytest.raises(RuntimeError, match="out must"):
+            triton_sparse_indexer_topk(
+                _device_tensor([[1, 2]]), 2, _output(1, 1), _scratch(1, 2, 2)
+            )
 
-    def test_stable_sort_capture_replay_matches_eager(self):
+    def test_scratch_capacity_helper_uses_ping_pong_chunk_capacity(self):
+        from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
+            sparse_indexer_topk_scratch_numel,
+            sparse_indexer_topk_scratch_shape,
+        )
+
+        assert sparse_indexer_topk_scratch_shape(3, 2049, 513) == (2, 3, 3, 1024)
+        assert sparse_indexer_topk_scratch_numel(3, 2049, 513) == 18_432
+
+    def test_scratch_capacity_is_validated(self):
         from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
             triton_sparse_indexer_topk,
         )
 
-        width, top_k = 8192, 512
-        captured_scores = (
-            (torch.arange(width, device="cuda") % 8).flip(0).float()[None, :]
-        )
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured_result = triton_sparse_indexer_topk(captured_scores, top_k)
-        graph.replay()
-        torch.cuda.synchronize()
-
-        expected = triton_sparse_indexer_topk(captured_scores, top_k)
-        torch.testing.assert_close(captured_result, expected)
-
-        captured_scores.copy_(captured_scores.roll(1, dims=1))
-        graph.replay()
-        torch.cuda.synchronize()
-
-        expected = triton_sparse_indexer_topk(captured_scores, top_k)
-        torch.testing.assert_close(captured_result, expected)
-
-    def test_stable_sort_microbenchmark_correctness(self):
-        """Exercise stable sort at target width without a flaky time threshold."""
-        from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
-            triton_sparse_indexer_topk,
-        )
-
-        width, top_k = 8192, 512
-        scores = (torch.arange(width, device="cuda") % 8).flip(0).float()[None, :]
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        result = triton_sparse_indexer_topk(scores, top_k)
-        end.record()
-        end.synchronize()
-        assert start.elapsed_time(end) >= 0
-
-        _, expected = torch.sort(scores, dim=-1, descending=True, stable=True)
-        torch.testing.assert_close(result, expected[:, :top_k].to(torch.int32))
-
+        scores = _device_tensor([[1, 2]])
+        with pytest.raises(RuntimeError, match="scratch must"):
+            triton_sparse_indexer_topk(
+                scores,
+                2,
+                _output(1, 2),
+                torch.empty(1, device="cuda", dtype=torch.uint64),
+            )
 
 def _make_paged_mqa_inputs() -> tuple[
     torch.Tensor,
@@ -176,7 +261,10 @@ def _paged_mqa_logits_reference(
     values = cache_flat[:, : block_size * head_dim].view(q.dtype)
     scales = cache_flat[:, block_size * head_dim :].view(torch.float32)
     logits = torch.full(
-        (q.shape[0], max_model_len), float("-inf"), dtype=torch.float32, device=q.device
+        (q.shape[0], max_model_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q.device,
     )
     dims = torch.arange(head_dim, device=q.device)
     for batch in range(q.shape[0]):
@@ -195,6 +283,7 @@ def _paged_mqa_logits_reference(
     return logits
 
 
+@_requires_gfx1151
 class TestTritonPagedMqaLogits:
     def test_matches_torch_reference_with_paged_shuffled_cache(self):
         from vllm.v1.attention.ops.triton_fp8_paged_mqa_logits import (
@@ -209,7 +298,12 @@ class TestTritonPagedMqaLogits:
         reset_workspace_manager()
         init_workspace_manager(torch.device("cuda"))
         actual = triton_fp8_paged_mqa_logits_gfx1151(
-            q, cache, weights, context_lens, block_tables, max_model_len=128
+            q,
+            cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len=128,
         ).clone()
         expected = _paged_mqa_logits_reference(
             q, cache, weights, context_lens, block_tables, max_model_len=128

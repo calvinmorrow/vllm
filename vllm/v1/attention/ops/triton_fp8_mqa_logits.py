@@ -102,8 +102,8 @@ def _fp8_mqa_logits_kernel(
     start_ind = tl.load(cu_start_ptr + row_id)
     end_ind = tl.load(cu_end_ptr + row_id)
 
-    start_ind = tl.maximum(start_ind, 0)
-    end_ind = tl.minimum(end_ind, seq_len_kv)
+    start_ind = tl.minimum(tl.maximum(start_ind, 0), seq_len_kv)
+    end_ind = tl.minimum(tl.maximum(end_ind, start_ind), seq_len_kv)
     shifted_end = end_ind - start_ind
     shifted_unmasked_end = shifted_end // BLOCK_KV * BLOCK_KV
 
@@ -156,15 +156,16 @@ def _fp8_mqa_logits_kernel(
     tl.store(logits_ptrs, scores, mask=in_window)
 
 
-def fp8_mqa_logits_gfx942(
+def triton_fp8_mqa_logits(
     q: torch.Tensor,
     k_fp8: torch.Tensor,
     kv_scales: torch.Tensor,
     weights: torch.Tensor,
     cu_starts: torch.Tensor,
     cu_ends: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute FP8 MQA logits on MI300X (gfx942) using the vendored kernel.
+    """Compute FP8 MQA logits using an optional caller-owned output.
 
     Drop-in replacement for ``aiter.ops.triton.attention.fp8_mqa_logits.
     fp8_mqa_logits`` on MI300X. Selects ``(BLOCK_KV, num_stages)`` based on
@@ -179,6 +180,7 @@ def fp8_mqa_logits_gfx942(
         weights: Per-head weights of shape ``[M, H]``, float32.
         cu_starts: Start indices (inclusive) of shape ``[M]``, int32.
         cu_ends: End indices (exclusive) of shape ``[M]``, int32.
+        out: Optional caller-owned contiguous float32 output of shape ``[M, N]``.
 
     Returns:
         Logits of shape ``[M, N]``, float32 -- positions outside
@@ -204,12 +206,26 @@ def fp8_mqa_logits_gfx942(
     # Initialise with -inf so positions outside [cu_starts, cu_ends) read
     # as ``-inf`` after the masked store path -- this matches AITER's
     # ``fp8_mqa_logits`` semantics and is what the top-k consumer expects.
-    logits = torch.full(
-        (seq_len, seq_len_kv),
-        fill_value=-float("inf"),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if out is None:
+        logits = torch.full(
+            (seq_len, seq_len_kv),
+            fill_value=-float("inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        if (
+            out.shape != (seq_len, seq_len_kv)
+            or out.dtype != torch.float32
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must be a contiguous same-device float32 tensor with shape "
+                "[q.shape[0], k_fp8.shape[0]]"
+            )
+        logits = out
+        logits.fill_(-float("inf"))
 
     if _gfx942_default_tile_fits_lds(num_heads, head_size):
         block_kv = 128
@@ -260,3 +276,7 @@ def fp8_mqa_logits_gfx942(
     )
 
     return logits
+
+
+# Kept as a compatibility name for the existing gfx942 fallback caller.
+fp8_mqa_logits_gfx942 = triton_fp8_mqa_logits

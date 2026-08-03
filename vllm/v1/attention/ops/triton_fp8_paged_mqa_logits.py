@@ -112,6 +112,7 @@ def triton_fp8_paged_mqa_logits_gfx1151(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute fixed-shape paged indexer logits without host scalar reads.
 
@@ -141,9 +142,22 @@ def triton_fp8_paged_mqa_logits_gfx1151(
     cache_flat = kv_cache.view(num_blocks, -1)
     cache_values = cache_flat[:, : block_size * head_dim].view(q_fp8.dtype)
     cache_scales = cache_flat[:, block_size * head_dim :].view(torch.float32)
-    (logits,) = current_workspace_manager().get_simultaneous(
-        ((batch_size * next_n, max_model_len), torch.float32),
-    )
+    if out is None:
+        (logits,) = current_workspace_manager().get_simultaneous(
+            ((batch_size * next_n, max_model_len), torch.float32),
+        )
+    else:
+        if (
+            out.device != q_fp8.device
+            or out.dtype != torch.float32
+            or out.shape != (batch_size * next_n, max_model_len)
+            or not out.is_contiguous()
+        ):
+            raise RuntimeError(
+                "out must be a contiguous FP32 tensor on q_fp8.device with shape "
+                "[batch_size * next_n, max_model_len]"
+            )
+        logits = out
     logits.fill_(float("-inf"))
 
     grid = (batch_size * next_n, triton.cdiv(max_model_len, 64))

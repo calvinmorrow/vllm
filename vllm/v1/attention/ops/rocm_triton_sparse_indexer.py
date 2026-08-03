@@ -57,10 +57,13 @@ def rocm_triton_sparse_attn_indexer(
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         cp_gather_indexer_k_quant_cache_triton,
         indexer_k_quant_and_cache_triton,
-        rocm_fp8_mqa_logits,
-        rocm_fp8_paged_mqa_logits,
+    )
+    from vllm.v1.attention.ops.triton_fp8_mqa_logits import triton_fp8_mqa_logits
+    from vllm.v1.attention.ops.triton_fp8_paged_mqa_logits import (
+        triton_fp8_paged_mqa_logits_gfx1151,
     )
     from vllm.v1.attention.ops.triton_sparse_indexer_topk import (
+        sparse_indexer_topk_scratch_shape,
         triton_sparse_indexer_topk_decode,
         triton_sparse_indexer_topk_prefill,
     )
@@ -82,6 +85,12 @@ def rocm_triton_sparse_attn_indexer(
         # [batch_size * next_n, max_model_len], not 3D.
         workspace_manager.get_simultaneous(
             ((hidden_states.shape[0], max_model_len), torch.float32),
+            (
+                sparse_indexer_topk_scratch_shape(
+                    hidden_states.shape[0], max_model_len, topk_tokens
+                ),
+                torch.uint64,
+            ),
         )
         max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         _ = torch.empty(
@@ -121,14 +130,22 @@ def rocm_triton_sparse_attn_indexer(
         assert prefill_metadata is not None
 
         workspace_manager = current_workspace_manager()
-        k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
-            ((total_seq_lens, head_dim), fp8_dtype),
-            ((total_seq_lens, 4), torch.uint8),
-        )
 
         for chunk in prefill_metadata.chunks:
-            k_fp8 = k_fp8_full[: chunk.total_seq_lens]
-            k_scale = k_scale_full[: chunk.total_seq_lens]
+            num_chunk_tokens = chunk.token_end - chunk.token_start
+            k_fp8, k_scale, logits, topk_scratch = (
+                workspace_manager.get_simultaneous(
+                    ((chunk.total_seq_lens, head_dim), fp8_dtype),
+                    ((chunk.total_seq_lens, 4), torch.uint8),
+                    ((num_chunk_tokens, chunk.total_seq_lens), torch.float32),
+                    (
+                        sparse_indexer_topk_scratch_shape(
+                            num_chunk_tokens, chunk.total_seq_lens, topk_tokens
+                        ),
+                        torch.uint64,
+                    ),
+                )
+            )
 
             cp_gather_indexer_k_quant_cache_triton(
                 kv_cache,
@@ -139,27 +156,27 @@ def rocm_triton_sparse_attn_indexer(
                 token_to_seq=chunk.token_to_seq,
             )
 
-            logits = rocm_fp8_mqa_logits(
+            triton_fp8_mqa_logits(
                 q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
+                k_fp8,
+                k_scale.view(torch.float32),
                 weights[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
+                out=logits,
             )
 
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            topk_indices.fill_(-1)
-
-            # Triton top-k selection (replaces torch.ops._C.top_k_per_row_prefill)
-            result = triton_sparse_indexer_topk_prefill(
+            triton_sparse_indexer_topk_prefill(
                 logits,
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
                 topk_tokens,
+                topk_indices,
+                topk_scratch,
             )
-            topk_indices.copy_(result)
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -182,26 +199,39 @@ def rocm_triton_sparse_attn_indexer(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
-        logits = rocm_fp8_paged_mqa_logits(
+        # Reserve the logits and selector planes together. The logits producer
+        # takes the first view; retaining the second prevents scratch from
+        # overlapping logits and fixes the workspace capacity before capture.
+        logits, topk_scratch = current_workspace_manager().get_simultaneous(
+            ((num_padded_tokens, max_model_len), torch.float32),
+            (
+                sparse_indexer_topk_scratch_shape(
+                    num_padded_tokens, max_model_len, topk_tokens
+                ),
+                torch.uint64,
+            ),
+        )
+        logits = triton_fp8_paged_mqa_logits_gfx1151(
             padded_q_fp8_decode_tokens,
             kv_cache,
             weights[:num_padded_tokens],
             decode_metadata.seq_lens,
             decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
+            out=logits,
         )
 
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
-        topk_indices.fill_(-1)
-
-        # Triton top-k selection (replaces torch.ops._C.top_k_per_row_decode)
-        result = triton_sparse_indexer_topk_decode(
+        # Output and scratch are caller-owned. Map padded decode rows to their
+        # source sequence in the Triton kernel to avoid repeat_interleave.
+        triton_sparse_indexer_topk_decode(
             logits,
-            decode_metadata.seq_lens.repeat_interleave(next_n),
+            decode_metadata.seq_lens,
             topk_tokens,
+            topk_indices,
+            topk_scratch,
+            repeats=next_n,
         )
-        topk_indices.copy_(result)
 
         if decode_metadata.requires_padding:
             topk_indices = unpack_seq_triton(
