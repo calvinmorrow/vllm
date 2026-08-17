@@ -542,6 +542,10 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         c = self.config
         w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+        # Symmetric types (e.g. uint4b8) encode the zero point as a fixed
+        # bias in the dtype; the raw packed qzeros param must not be passed
+        # to the kernel as a zero point. Matches TritonW4A16LinearKernel.
+        w_zp = None if c.weight_type.has_bias() else w_zp
 
         x_2d = x.reshape(-1, x.shape[-1])
         N = w_q.shape[0]

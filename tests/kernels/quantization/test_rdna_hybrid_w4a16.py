@@ -523,3 +523,95 @@ def test_rdna_hybrid_w4a16_dispatch(dtype, M, K, N, G):
     ref = _hip_skinny_reference(a, w_int4_nk, scales, group_size=G, zp_bias=8)
 
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# apply_weights zero-point forwarding (symmetric vs asymmetric)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
+def test_rdna_hybrid_w4a16_apply_weights_zp_handling(dist_init, monkeypatch):
+    """apply_weights must not forward a raw packed qzeros as a zero point.
+
+    Symmetric uint4b8 AutoRound checkpoints register a raw packed ``qzeros``
+    parameter (AutoGPTQLinearMethod always does) even though
+    ``zero_points=False``; the dtype encodes the zero point as a fixed bias,
+    so ``w_zp`` must be ``None``. Asymmetric uint4 must forward the unpacked
+    zero point. Guards the ``w_zp = None if c.weight_type.has_bias()`` guard.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP device not available")
+
+    import vllm._custom_ops  # noqa: F401  register the op
+    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+        MPLinearLayerConfig,
+    )
+    from vllm.scalar_type import scalar_types
+
+    set_random_seed(0)
+    K, N, G = 256, 128, 128
+    assert K % G == 0 and N % 8 == 0
+
+    captured: dict = {}
+
+    def _fake_op(x, w_q, w_s, w_zp, bias, cu, gs):
+        captured["w_zp"] = w_zp
+        return torch.zeros(x.shape[0], w_q.shape[0], dtype=x.dtype, device=x.device)
+
+    monkeypatch.setattr(torch.ops.vllm, "rdna_hybrid_w4a16_apply", _fake_op)
+
+    def _build(weight_type, zero_points, w_zp_name):
+        w_ckpt = torch.randint(0, 16, (K, N), device=device, dtype=torch.int32)
+        w_ckpt_nk8 = _pack_int4_along_k_to_ckpt(w_ckpt)
+        scales = 0.05 * torch.rand((N, K // G), device=device, dtype=torch.float16)
+        zeros_ckpt = None
+        if zero_points:
+            zeros_ckpt = _pack_int4_along_n_for_zp(
+                torch.randint(0, 16, (K // G, N), device=device, dtype=torch.int32)
+            ).t().contiguous()
+        layer = _build_dummy_layer(w_ckpt_nk8, scales, zeros_ckpt=zeros_ckpt)
+        if not zero_points:
+            # Mirror AutoGPTQLinearMethod: a raw packed qzeros is registered
+            # even when zero_points is False and never transformed.
+            raw_qzeros = torch.randint(
+                0, 256, (K // G, N // 8), device=device, dtype=torch.int32
+            )
+            layer.register_parameter(
+                "qzeros", torch.nn.Parameter(raw_qzeros, requires_grad=False)
+            )
+        config = MPLinearLayerConfig(
+            full_weight_shape=(K, N),
+            partition_weight_shape=(K, N),
+            weight_type=weight_type,
+            act_type=torch.float16,
+            group_size=G,
+            zero_points=zero_points,
+            has_g_idx=False,
+        )
+        kernel = RDNAHybridW4A16LinearKernel(
+            config,
+            w_q_param_name="weight_packed",
+            w_s_param_name="weight_scale",
+            w_zp_param_name=w_zp_name,
+            w_gidx_param_name=None,
+        )
+        kernel.process_weights_after_loading(layer)
+        return layer, kernel
+
+    x = torch.randn(1, K, device=device, dtype=torch.float16)
+
+    # Symmetric (uint4b8): fixed bias in the dtype -> forward w_zp=None.
+    layer, kernel = _build(scalar_types.uint4b8, zero_points=False, w_zp_name="qzeros")
+    assert getattr(layer, "qzeros") is not None  # raw packed qzeros is present
+    kernel.apply_weights(layer, x)
+    assert captured["w_zp"] is None
+
+    # Asymmetric (uint4): forward the unpacked per-group zero point.
+    layer, kernel = _build(
+        scalar_types.uint4, zero_points=True, w_zp_name="weight_zero_point"
+    )
+    kernel.apply_weights(layer, x)
+    assert captured["w_zp"] is not None
+    assert captured["w_zp"].dtype == torch.float16
+    assert tuple(captured["w_zp"].shape) == (N, K // G)
