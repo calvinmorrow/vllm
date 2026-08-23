@@ -86,24 +86,14 @@ def _fp8_mqa_logits_kernel(
 
     logits_row_ptrs = logits_ptr + row_id * stride_logits_s
 
-    h_inds = tl.arange(0, NUM_HEADS)[:, None]
     d_inds = tl.arange(0, HEAD_SIZE)
-
-    # load Q[BLOCK_Q, NUM_HEADS, HEAD_SIZE]
-    q_ptrs = (
-        Q_ptr + row_id * stride_q_s + h_inds * stride_q_h + d_inds[None, :] * stride_q_d
-    )
-
-    q_block = tl.load(q_ptrs, cache_modifier=".cg")
-    w_ptrs = weights_ptr + row_id * stride_w_s + h_inds * stride_w_h
-    w_block = tl.load(w_ptrs, cache_modifier=".cg").to(tl.float32)
 
     # Load start/end for each row in this block
     start_ind = tl.load(cu_start_ptr + row_id)
     end_ind = tl.load(cu_end_ptr + row_id)
 
-    start_ind = tl.maximum(start_ind, 0)
-    end_ind = tl.minimum(end_ind, seq_len_kv)
+    start_ind = tl.minimum(tl.maximum(start_ind, 0), seq_len_kv)
+    end_ind = tl.minimum(tl.maximum(end_ind, start_ind), seq_len_kv)
     shifted_end = end_ind - start_ind
     shifted_unmasked_end = shifted_end // BLOCK_KV * BLOCK_KV
 
@@ -121,15 +111,19 @@ def _fp8_mqa_logits_kernel(
         kv_block = tl.load(kv_ptrs)
         kv_scales = tl.load(kv_scales_ptrs)
 
-        # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-        scores = tl.dot(q_block, kv_block, input_precision="ieee")
-        # Multiply by kv_scales (broadcast along rows)
-        scores = scores * kv_scales[None, :]
-        # ReLU
-        scores = tl.maximum(scores, 0.0)
-        scores = scores * w_block
-        # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
-        scores = tl.sum(scores, axis=0)
+        kv_block_f32 = kv_block.to(tl.float32)
+        scores = tl.zeros((BLOCK_KV,), dtype=tl.float32)
+        for h in tl.static_range(0, NUM_HEADS):
+            q_head = tl.load(
+                Q_ptr + row_id * stride_q_s + h * stride_q_h + d_inds * stride_q_d,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+            head_scores = tl.sum(q_head[:, None] * kv_block_f32, axis=0)
+            weight = tl.load(
+                weights_ptr + row_id * stride_w_s + h * stride_w_h,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+            scores += tl.maximum(head_scores * kv_scales, 0.0) * weight
         tl.store(logits_ptrs, scores)
 
         kv_ptrs += BLOCK_KV * stride_kv_s
@@ -142,29 +136,34 @@ def _fp8_mqa_logits_kernel(
     kv_block = tl.load(kv_ptrs, mask=kv_col_mask[None, :], other=0.0)
     kv_scales = tl.load(kv_scales_ptrs, mask=kv_col_mask, other=0.0)
 
-    # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-    scores = tl.dot(q_block, kv_block, input_precision="ieee")
-    # Multiply by kv_scales (broadcast along rows)
-    scores = scores * kv_scales[None, :]
-    # ReLU
-    scores = tl.maximum(scores, 0.0)
-    scores = scores * w_block
-    # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
-    scores = tl.sum(scores, axis=0)
+    kv_block_f32 = kv_block.to(tl.float32)
+    scores = tl.zeros((BLOCK_KV,), dtype=tl.float32)
+    for h in tl.static_range(0, NUM_HEADS):
+        q_head = tl.load(
+            Q_ptr + row_id * stride_q_s + h * stride_q_h + d_inds * stride_q_d,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        head_scores = tl.sum(q_head[:, None] * kv_block_f32, axis=0)
+        weight = tl.load(
+            weights_ptr + row_id * stride_w_s + h * stride_w_h,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        scores += tl.maximum(head_scores * kv_scales, 0.0) * weight
     # masked store
     in_window = (kv_col_offsets >= start_ind) & (kv_col_offsets < end_ind)
     tl.store(logits_ptrs, scores, mask=in_window)
 
 
-def fp8_mqa_logits_gfx942(
+def triton_fp8_mqa_logits(
     q: torch.Tensor,
     k_fp8: torch.Tensor,
     kv_scales: torch.Tensor,
     weights: torch.Tensor,
     cu_starts: torch.Tensor,
     cu_ends: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute FP8 MQA logits on MI300X (gfx942) using the vendored kernel.
+    """Compute FP8 MQA logits using an optional caller-owned output.
 
     Drop-in replacement for ``aiter.ops.triton.attention.fp8_mqa_logits.
     fp8_mqa_logits`` on MI300X. Selects ``(BLOCK_KV, num_stages)`` based on
@@ -179,6 +178,7 @@ def fp8_mqa_logits_gfx942(
         weights: Per-head weights of shape ``[M, H]``, float32.
         cu_starts: Start indices (inclusive) of shape ``[M]``, int32.
         cu_ends: End indices (exclusive) of shape ``[M]``, int32.
+        out: Optional caller-owned contiguous float32 output of shape ``[M, N]``.
 
     Returns:
         Logits of shape ``[M, N]``, float32 -- positions outside
@@ -204,12 +204,26 @@ def fp8_mqa_logits_gfx942(
     # Initialise with -inf so positions outside [cu_starts, cu_ends) read
     # as ``-inf`` after the masked store path -- this matches AITER's
     # ``fp8_mqa_logits`` semantics and is what the top-k consumer expects.
-    logits = torch.full(
-        (seq_len, seq_len_kv),
-        fill_value=-float("inf"),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if out is None:
+        logits = torch.full(
+            (seq_len, seq_len_kv),
+            fill_value=-float("inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        if (
+            out.shape != (seq_len, seq_len_kv)
+            or out.dtype != torch.float32
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must be a contiguous same-device float32 tensor with shape "
+                "[q.shape[0], k_fp8.shape[0]]"
+            )
+        logits = out
+        logits.fill_(-float("inf"))
 
     if _gfx942_default_tile_fits_lds(num_heads, head_size):
         block_kv = 128
@@ -220,11 +234,6 @@ def fp8_mqa_logits_gfx942(
         # needs ~33 KiB and clears the per-WG budget with margin.
         block_kv = 64
         num_stages = 1
-
-    # heuristic for MFMA instruction shape, identical to AITER's choice
-    matrix_instr_nonkdim = 32
-    if seq_len <= 1024:
-        matrix_instr_nonkdim = 16
 
     stride_q_s, stride_q_h, stride_q_d = q.stride()
     stride_kv_s, stride_kv_d = k_fp8.stride()
@@ -256,7 +265,10 @@ def fp8_mqa_logits_gfx942(
         num_warps=4,
         num_stages=num_stages,
         waves_per_eu=2,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
     )
 
     return logits
+
+
+# Kept as a compatibility name for the existing gfx942 fallback caller.
+fp8_mqa_logits_gfx942 = triton_fp8_mqa_logits

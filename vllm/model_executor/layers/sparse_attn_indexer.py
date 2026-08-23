@@ -35,11 +35,23 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
+from vllm.v1.attention.ops.rocm_triton_sparse_indexer import (
+    is_rocm_triton_sparse_indexer_available,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+
+
+def use_rocm_triton_sparse_indexer() -> bool:
+    """Return whether ROCm should use the independent Triton indexer."""
+    return (
+        is_rocm_triton_sparse_indexer_available()
+        and not rocm_aiter_ops.is_enabled()
+        and not rocm_aiter_ops.is_rdna_aiter_enabled()
+    )
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -855,6 +867,25 @@ class SparseAttnIndexer(CustomOp):
         )
         from vllm.platforms.rocm import on_gfx11
 
+        if use_rocm_triton_sparse_indexer():
+            return torch.ops.vllm.rocm_triton_sparse_attn_indexer(
+                hidden_states,
+                _encode_layer_name(self.k_cache.prefix),
+                self.k_cache.kv_cache,
+                q_quant,
+                k,
+                weights,
+                self.quant_block_size,
+                self.scale_fmt,
+                self.topk_tokens,
+                self.head_dim,
+                self.max_model_len,
+                self.max_total_seq_len,
+                self.topk_indices_buffer,
+                skip_k_cache_insert=self.skip_k_cache_insert,
+                compress_ratio=self.compress_ratio,
+            )
+
         if (
             rocm_aiter_ops.is_enabled()
             or rocm_aiter_ops.is_rdna_aiter_enabled()
@@ -878,6 +909,6 @@ class SparseAttnIndexer(CustomOp):
                 compress_ratio=self.compress_ratio,
             )
         raise RuntimeError(
-            "Sparse attention indexer ROCm path is only supported on AITER. "
-            "Please enable aiter with VLLM_ROCM_USE_AITER=1"
+            "Sparse attention indexer ROCm requires AITER or the independent "
+            "gfx1151 Triton fallback."
         )

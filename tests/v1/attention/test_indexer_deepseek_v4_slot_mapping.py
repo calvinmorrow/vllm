@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import create_vllm_config
+from vllm.model_executor.layers import sparse_attn_indexer
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     BuildPrefillChunkMetadataKernel,
@@ -14,6 +15,72 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
+
+
+def test_rocm_triton_sparse_indexer_availability(monkeypatch):
+    from vllm.v1.attention.ops import rocm_triton_sparse_indexer
+
+    monkeypatch.setattr(
+        rocm_triton_sparse_indexer.current_platform, "is_rocm", lambda: True
+    )
+    monkeypatch.setattr(rocm_triton_sparse_indexer, "on_gfx1151", lambda: True)
+    assert rocm_triton_sparse_indexer.is_rocm_triton_sparse_indexer_available()
+
+    monkeypatch.setattr(rocm_triton_sparse_indexer, "on_gfx1151", lambda: False)
+    assert not rocm_triton_sparse_indexer.is_rocm_triton_sparse_indexer_available()
+
+
+def test_rocm_triton_sparse_indexer_dispatch_requires_no_aiter(monkeypatch):
+    monkeypatch.setattr(
+        sparse_attn_indexer,
+        "is_rocm_triton_sparse_indexer_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(sparse_attn_indexer.rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(
+        sparse_attn_indexer.rocm_aiter_ops,
+        "is_rdna_aiter_enabled",
+        lambda: False,
+    )
+    assert sparse_attn_indexer.use_rocm_triton_sparse_indexer()
+
+    monkeypatch.setattr(sparse_attn_indexer.rocm_aiter_ops, "is_enabled", lambda: True)
+    assert not sparse_attn_indexer.use_rocm_triton_sparse_indexer()
+
+
+def test_rocm_triton_sparse_indexer_accepts_compressed_kv(monkeypatch):
+    from vllm.v1.attention.ops import rocm_triton_sparse_indexer
+
+    sentinel = object()
+    monkeypatch.setattr(
+        rocm_triton_sparse_indexer,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=None),
+    )
+    monkeypatch.setattr(
+        rocm_triton_sparse_indexer,
+        "_rocm_triton_sparse_attn_indexer_impl",
+        lambda *_args: sentinel,
+    )
+
+    result = rocm_triton_sparse_indexer.rocm_triton_sparse_attn_indexer(
+        torch.empty(0),
+        "indexer.k_cache",
+        torch.empty(0),
+        torch.empty(0),
+        None,
+        torch.empty(0),
+        128,
+        "dynamic",
+        1,
+        128,
+        1,
+        1,
+        torch.empty(0, dtype=torch.int32),
+        compress_ratio=4,
+    )
+
+    assert result is sentinel
 
 
 def test_indexer_warmup_normalizes_zero_compress_ratios():

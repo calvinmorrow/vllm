@@ -774,6 +774,7 @@ class CompilationConfig:
         "vllm::olmo_hybrid_gdn_full_forward",
         "vllm::sparse_attn_indexer",
         "vllm::rocm_aiter_sparse_attn_indexer",
+        "vllm::rocm_triton_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
         "vllm::hpc_rope_norm_forward",
     ]
