@@ -6,6 +6,7 @@ import functools
 import json
 import os
 from collections.abc import Callable, Sequence
+from threading import Lock
 from typing import Any
 
 import torch
@@ -37,6 +38,129 @@ from vllm.utils.deep_gemm import (
 from vllm.utils.platform_utils import get_device_name_as_file_name
 
 logger = init_logger(__name__)
+
+_LOG_BLOCK_FP8_SHAPES = envs.VLLM_LOG_BLOCK_FP8_SHAPES
+_MAX_LOGGED_BLOCK_FP8_SHAPES = 128
+_MAX_LOGGED_BLOCK_FP8_INVENTORY_ENTRIES = 32
+_logged_block_fp8_shapes: set[tuple[Any, ...]] = set()
+_logged_block_fp8_shapes_lock = Lock()
+
+
+def log_block_fp8_shape(
+    site: str,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: Sequence[int],
+    output_dtype: torch.dtype,
+    backend: str,
+    logical_weight_shape: Sequence[int] | None = None,
+    config: dict[str, Any] | None = None,
+) -> None:
+    """Log a bounded, de-duplicated block-FP8 GEMM shape for tuning."""
+    if not _LOG_BLOCK_FP8_SHAPES:
+        return
+
+    M = A.numel() // A.shape[-1]
+    if logical_weight_shape is None:
+        N, K = B.shape
+    else:
+        N, K = logical_weight_shape
+    config_text = json.dumps(config, sort_keys=True) if config is not None else None
+    key = (
+        site,
+        M,
+        N,
+        K,
+        tuple(block_size),
+        str(output_dtype),
+        backend,
+        config_text,
+    )
+    with _logged_block_fp8_shapes_lock:
+        if (
+            key in _logged_block_fp8_shapes
+            or len(_logged_block_fp8_shapes) >= _MAX_LOGGED_BLOCK_FP8_SHAPES
+        ):
+            return
+        _logged_block_fp8_shapes.add(key)
+
+    logger.info(
+        "Block FP8 shape: site=%s M=%d N=%d K=%d block_size=%s "
+        "output_dtype=%s backend=%s config=%s A_shape=%s As_shape=%s "
+        "B_shape=%s Bs_shape=%s",
+        site,
+        M,
+        N,
+        K,
+        tuple(block_size),
+        output_dtype,
+        backend,
+        config_text,
+        tuple(A.shape),
+        tuple(As.shape),
+        tuple(B.shape),
+        tuple(Bs.shape),
+    )
+
+
+def log_block_fp8_weight_inventory(
+    site: str, modules: Sequence[tuple[str, torch.nn.Module]]
+) -> None:
+    """Log a bounded summary of loaded block-FP8 weights before preshuffling."""
+    if not _LOG_BLOCK_FP8_SHAPES:
+        return
+
+    inventory: dict[tuple[Any, ...], list[str]] = {}
+    for name, module in modules:
+        weight = getattr(module, "weight", None)
+        scale = getattr(module, "weight_scale_inv", None)
+        if (
+            not isinstance(weight, torch.Tensor)
+            or not isinstance(scale, torch.Tensor)
+            or weight.ndim != 2
+            or scale.ndim != 2
+            or not is_fp8(weight)
+        ):
+            continue
+        N, K = weight.shape
+        expected_scale_shape = (triton.cdiv(N, 128), triton.cdiv(K, 128))
+        if tuple(scale.shape) != expected_scale_shape:
+            continue
+        key = (
+            tuple(weight.shape),
+            tuple(scale.shape),
+            str(weight.dtype),
+            str(scale.dtype),
+        )
+        inventory.setdefault(key, []).append(name)
+
+    if not inventory:
+        return
+
+    all_entries = tuple(
+        (weight_shape, scale_shape, weight_dtype, scale_dtype, len(names), names[0])
+        for (weight_shape, scale_shape, weight_dtype, scale_dtype), names in sorted(
+            inventory.items()
+        )
+    )
+    entries = all_entries[:_MAX_LOGGED_BLOCK_FP8_INVENTORY_ENTRIES]
+    key = ("inventory", site, entries, len(all_entries))
+    with _logged_block_fp8_shapes_lock:
+        if (
+            key in _logged_block_fp8_shapes
+            or len(_logged_block_fp8_shapes) >= _MAX_LOGGED_BLOCK_FP8_SHAPES
+        ):
+            return
+        _logged_block_fp8_shapes.add(key)
+
+    logger.info(
+        "Block FP8 weight inventory: site=%s entries=%s omitted_entries=%d",
+        site,
+        entries,
+        len(all_entries) - len(entries),
+    )
 
 
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:
@@ -955,6 +1079,18 @@ def w8a8_triton_block_scaled_mm(
             "num_warps": 4,
             "num_stages": 2,
         }
+
+    log_block_fp8_shape(
+        "triton_w8a8_block_scaled_mm",
+        A,
+        B,
+        As,
+        Bs,
+        block_size,
+        output_dtype,
+        "triton",
+        config=config,
+    )
 
     def grid(META):
         return (

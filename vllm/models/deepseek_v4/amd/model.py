@@ -44,6 +44,9 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     is_shared_expert_quant_fse_compatible,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    log_block_fp8_weight_inventory,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -1043,6 +1046,9 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
+        log_block_fp8_weight_inventory(
+            "deepseek_v4_amd.post_load", tuple(self.named_modules())
+        )
         # After per-layer quant finalize, so we preshuffle the final fp8 weights.
         for module in self.modules():
             if isinstance(module, DeepseekV4ROCMAiterMLAAttention):
