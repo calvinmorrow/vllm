@@ -11,6 +11,10 @@ import math
 import pytest
 import torch
 
+from benchmarks.kernels._block_fp8_benchmark_utils import (
+    rotate_timing_order,
+    tensors_within_tolerance,
+)
 from tests.kernels.quant_utils import native_w8a8_block_matmul
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _upcast_e8m0_to_fp32,
@@ -215,3 +219,40 @@ def test_nearest_m_key_tie_breaks_to_smaller_cpu():
     assert abs(2 - 3) == abs(4 - 3) == 1
     # Sanity: math.fabs used for the distance is symmetric.
     assert math.fabs(3 - 2) == math.fabs(3 - 4)
+
+
+def test_rotating_timing_order_cpu():
+    """Every candidate occupies every timing position over a complete cycle."""
+    items = ["baseline", "candidate_a", "candidate_b"]
+
+    orders = [rotate_timing_order(items, index) for index in range(4)]
+
+    assert orders == [
+        ["baseline", "candidate_a", "candidate_b"],
+        ["candidate_a", "candidate_b", "baseline"],
+        ["candidate_b", "baseline", "candidate_a"],
+        ["baseline", "candidate_a", "candidate_b"],
+    ]
+    assert rotate_timing_order([], 0) == []
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected", "rel_tol", "abs_tol", "passed"),
+    [
+        ([1.125], [1.0], 0.0, 0.125, True),
+        ([1.126], [1.0], 0.0, 0.125, False),
+        ([10.5], [10.0], 0.05, 0.0, True),
+        ([10.501], [10.0], 0.05, 0.0, False),
+        ([0.125], [0.0], 0.0, 0.125, True),
+        ([float("nan")], [1.0], 0.1, 0.1, False),
+    ],
+)
+def test_tolerance_gate_cpu(actual, expected, rel_tol, abs_tol, passed):
+    """The correctness gate uses the declared absolute and relative bounds."""
+    actual_tensor = torch.tensor(actual)
+    expected_tensor = torch.tensor(expected)
+
+    assert (
+        tensors_within_tolerance(actual_tensor, expected_tensor, rel_tol, abs_tol)
+        is passed
+    )

@@ -32,6 +32,10 @@ from typing import Any
 import torch
 from tqdm import tqdm
 
+from benchmarks.kernels._block_fp8_benchmark_utils import (
+    rotate_timing_order,
+    tensors_within_tolerance,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _upcast_e8m0_to_fp32,
     _w8a8_triton_block_scaled_mm,
@@ -321,7 +325,8 @@ def correctness_check(
         abs_tol: Absolute-error pass threshold.
 
     Returns:
-        Dict with max_abs_err, mean_rel_err, passed, and the output dtype.
+        Dict with absolute/relative error summaries, declared tolerances, pass
+        status, and output dtype.
     """
     out = launch_candidate(A, B, As, Bs, block_size, config, output_dtype)
     out_f = out.to(torch.float32)
@@ -331,22 +336,18 @@ def correctness_check(
     max_abs = float(diff.max().item())
     denom = float(ref_abs.mean().item())
     mean_rel = (float(diff.mean().item()) / denom) if denom else 0.0
-    # Per-element relative error, guarding zero-magnitude reference elements
-    # with the mean magnitude so a single 0/0 cannot dominate the max.
-    max_rel = float((diff / (ref_abs + denom)).max().item())
-    # bf16 has an 8-bit mantissa (~2^-8 ~ 0.004 relative spacing). A correct
-    # config accumulates to machine-precision mean relative error with at most
-    # a few 1-ULP differences at large-magnitude elements, so gate on mean
-    # relative error (a wrong scale/tile config yields mean_rel >> rel_tol) and
-    # on max relative error (any element-level corruption). Both are
-    # magnitude-robust; a fixed absolute tolerance is not, because valid bf16
-    # outputs here can reach ~1e6 magnitude where one 1-ULP step is ~4096.
-    passed = bool(mean_rel < rel_tol and max_rel < 0.05)
+    relative_denom = ref_abs.clamp_min(abs_tol)
+    max_rel = float((diff / relative_denom).max().item())
+    finite = bool(torch.isfinite(out_f).all() and torch.isfinite(ref_f).all())
+    passed = tensors_within_tolerance(out_f, ref_f, rel_tol, abs_tol)
     return {
         "max_abs_err": max_abs,
         "max_rel_err": max_rel,
         "mean_rel_err": mean_rel,
         "rel_tol": rel_tol,
+        "abs_tol": abs_tol,
+        "finite": finite,
+        "zero_reference_count": int((ref_abs == 0).sum().item()),
         "passed": passed,
         "out_dtype": str(out.dtype),
     }
@@ -429,8 +430,8 @@ def run_evidence(args) -> int:
 
     For each target (M, N, K): build production-layout operands, gate every
     candidate against the native block-matmul reference, then measure the
-    surviving candidates (baseline first) with interleaved single-sample
-    passes for anti-drift, and emit full statistics plus raw samples. A winner
+    surviving candidates with cyclically rotated single-sample passes for
+    anti-drift, and emit full statistics plus raw samples. A winner
     is a correct candidate whose median beats the baseline by at least
     ``accept_pct`` and by more than the combined observed variability, with a
     stable CV. The record is written incrementally after every target.
@@ -488,7 +489,14 @@ def run_evidence(args) -> int:
             "baseline": GENERIC_FALLBACK,
             "n_candidates": len(family) + 1,
             "candidate_source": (args.candidate_file or "none"),
-            "anti_drift": "interleaved baseline/candidate per-pass ordering",
+            "timing_order": {
+                "policy": "cyclic_rotation",
+                "description": (
+                    "The canonical baseline-first order is rotated once per "
+                    "pass so every candidate occupies every ordinal position "
+                    "over a complete cycle."
+                ),
+            },
         },
         "results": [],
     }
@@ -553,7 +561,8 @@ def run_evidence(args) -> int:
                                  out_dtype)
         torch.cuda.synchronize()
 
-        # Interleaved anti-drift measurement: one sample per config per pass.
+        # One sample per config per pass, with a cyclic order to avoid a fixed
+        # baseline-first or candidate-position bias.
         order = list(survivors)
         base_key = _cfg_key(GENERIC_FALLBACK)
         if base_key in {_cfg_key(c) for c in survivors}:
@@ -563,14 +572,24 @@ def run_evidence(args) -> int:
         samples: dict[tuple, list[float]] = {
             _cfg_key(c): [] for c in order
         }
-        for _ in range(args.confirm_iters):
-            for c in order:
+        target_rec["timing_order"] = {
+            "policy": "cyclic_rotation",
+            "canonical_order": order,
+            "rotation_offsets": (
+                [
+                    pass_index % len(order)
+                    for pass_index in range(args.confirm_iters)
+                ]
+                if order
+                else []
+            ),
+        }
+        for pass_index in range(args.confirm_iters):
+            for c in rotate_timing_order(order, pass_index):
                 key = _cfg_key(c)
-                if key in samples:
-                    samples[key].append(
-                        _one_sample(A, B, As, Bs, [block_n, block_k], c,
-                                    out_dtype)
-                    )
+                samples[key].append(
+                    _one_sample(A, B, As, Bs, [block_n, block_k], c, out_dtype)
+                )
 
         base_med = None
         for c in order:

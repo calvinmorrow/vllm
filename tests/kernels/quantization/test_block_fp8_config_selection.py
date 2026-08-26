@@ -1,32 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# CPU-only integration harness for the W8A8 block-FP8 static-config selection
-# path (Req 9.2-9.3). No GPU required: exercises get_w8a8_block_fp8_configs
-# file lookup, log messages, nearest-M key selection, and fallback behavior.
+"""CPU-only tests for W8A8 Block-FP8 static configuration selection."""
 
 import json
 import logging
-import os
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    get_w8a8_block_fp8_configs,
-)
+from vllm.model_executor.layers.quantization.utils import fp8_utils
 
-# The config directory that get_w8a8_block_fp8_configs reads from.
-CONFIGS_DIR = Path(
-    os.path.dirname(
-        os.path.realpath(
-            "vllm/model_executor/layers/quantization/utils/fp8_utils.py"
-        )
-    )
-) / "configs"
-
-# The exact six confirmed runtime (N, K) shapes.
+DEVICE_TOKEN = "AMD_Radeon_8060S"
+GENERIC_FALLBACK = {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 32,
+    "num_warps": 4,
+    "num_stages": 2,
+}
 SIX_SHAPES = [
     (4096, 8192),
     (4096, 4096),
@@ -36,158 +29,118 @@ SIX_SHAPES = [
     (1536, 4096),
 ]
 
-DEVICE_TOKEN = "AMD_Radeon_8060S"
-
 
 def _config_filename(N: int, K: int) -> str:
     return (
         f"N={N},K={K},device_name={DEVICE_TOKEN},"
-        f"dtype=fp8_w8a8,block_shape=[128,128].json"
+        "dtype=fp8_w8a8,block_shape=[128,128].json"
     )
 
 
-def _make_config_file(N: int, K: int, m_keys: dict[str, dict]) -> str:
-    """Write a config file into the real configs dir; return its path."""
-    path = CONFIGS_DIR / _config_filename(N, K)
+def _nearest_key(configs: dict[int, dict], M: int) -> int:
+    return min(configs, key=lambda key: abs(key - M))
+
+
+@pytest.fixture(autouse=True)
+def clear_config_cache():
+    """Clear the cached loader around every filesystem-isolated test."""
+    fp8_utils.get_w8a8_block_fp8_configs.cache_clear()
+    yield
+    fp8_utils.get_w8a8_block_fp8_configs.cache_clear()
+
+
+@pytest.fixture
+def isolated_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the real loader's derived config directory to temporary files."""
+    monkeypatch.setattr(fp8_utils, "__file__", str(tmp_path / "fp8_utils.py"))
+    monkeypatch.setattr(
+        fp8_utils,
+        "get_device_name_as_file_name",
+        lambda: DEVICE_TOKEN,
+    )
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    return config_dir
+
+
+def _write_config(
+    config_dir: Path, N: int, K: int, m_keys: dict[str, dict]
+) -> Path:
+    path = config_dir / _config_filename(N, K)
     path.write_text(json.dumps(m_keys, indent=2) + "\n")
-    get_w8a8_block_fp8_configs.cache_clear()
-    return str(path)
+    fp8_utils.get_w8a8_block_fp8_configs.cache_clear()
+    return path
 
 
-def _remove_config_file(N: int, K: int) -> None:
-    path = CONFIGS_DIR / _config_filename(N, K)
-    if path.exists():
-        path.unlink()
-    get_w8a8_block_fp8_configs.cache_clear()
+def test_missing_file_returns_none_and_warns(isolated_config_dir, caplog):
+    """An absent file returns None and emits the fallback warning."""
+    with caplog.at_level(logging.WARNING):
+        result = fp8_utils.get_w8a8_block_fp8_configs(4096, 8192, 128, 128)
+
+    assert result is None
+    assert "Config file not found" in caplog.text
 
 
-class TestConfigFileSelection:
-    """Verify get_w8a8_block_fp8_configs file lookup and log messages."""
-
-    @pytest.fixture(autouse=True)
-    def _cleanup(self):
-        """Ensure a clean slate before and after each test."""
-        for N, K in SIX_SHAPES:
-            _remove_config_file(N, K)
-        yield
-        for N, K in SIX_SHAPES:
-            _remove_config_file(N, K)
-
-    def test_missing_file_returns_none_and_warns(self, caplog):
-        """No config file -> None + the missing-file warning."""
-        with caplog.at_level(logging.WARNING):
-            result = get_w8a8_block_fp8_configs(4096, 8192, 128, 128)
-        assert result is None
-        assert "Config file not found" in caplog.text
-
-    def test_present_file_returns_config_and_info_log(self, caplog):
-        """Config file present -> dict + the 'Using configuration from' log."""
-        m_keys = {
-            "1": {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 2,
-            }
+def test_present_file_returns_config_and_info_log(isolated_config_dir, caplog):
+    """The loader reads an isolated JSON file through its production path."""
+    m_keys = {
+        "1": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
         }
-        path = _make_config_file(4096, 8192, m_keys)
-        with caplog.at_level(logging.INFO):
-            result = get_w8a8_block_fp8_configs(4096, 8192, 128, 128)
-        assert result is not None
-        assert 1 in result
-        assert result[1]["BLOCK_SIZE_M"] == 16
-        assert "Using configuration from" in caplog.text
-        assert path in caplog.text
-        assert "Config file not found" not in caplog.text
+    }
+    path = _write_config(isolated_config_dir, 4096, 8192, m_keys)
+
+    with caplog.at_level(logging.INFO):
+        result = fp8_utils.get_w8a8_block_fp8_configs(4096, 8192, 128, 128)
+
+    assert result == {1: m_keys["1"]}
+    assert "Using configuration from" in caplog.text
+    assert str(path) in caplog.text
+    assert "Config file not found" not in caplog.text
 
 
-class TestNearestMSelection:
-    """Verify the nearest-M key selection used by the launcher."""
+def test_uncovered_shape_returns_none_with_isolated_config(isolated_config_dir):
+    """A config for one shape does not cover a sibling shape."""
+    _write_config(isolated_config_dir, 4096, 8192, {"1": GENERIC_FALLBACK})
 
-    @pytest.fixture(autouse=True)
-    def _cleanup(self):
-        yield
-        for N, K in SIX_SHAPES:
-            _remove_config_file(N, K)
-
-    def _nearest_key(self, configs: dict[int, dict], M: int) -> int:
-        """Replicate the launcher's nearest-M selection exactly."""
-        return min(configs.keys(), key=lambda x: abs(x - M))
-
-    def test_single_key_routes_all_m(self):
-        """A file with only key '1' routes every M to it (not single-token)."""
-        configs = {1: {"BLOCK_SIZE_M": 16}}
-        for M in (1, 2, 4, 8, 16, 69, 256, 1000):
-            assert self._nearest_key(configs, M) == 1
-
-    def test_multi_key_routes_to_intended_region(self):
-        """With keys 1/4/8/16/69/256, each M routes to the intended key."""
-        configs = {1: {}, 4: {}, 8: {}, 16: {}, 69: {}, 256: {}}
-        assert self._nearest_key(configs, 1) == 1
-        assert self._nearest_key(configs, 2) == 1
-        assert self._nearest_key(configs, 3) == 4
-        assert self._nearest_key(configs, 4) == 4
-        assert self._nearest_key(configs, 5) == 4
-        # M=6 is a tie between keys 4 and 8 (both distance 2); min resolves to
-        # the first-encountered (smaller) key 4.
-        assert self._nearest_key(configs, 6) == 4
-        assert self._nearest_key(configs, 7) == 8
-        assert self._nearest_key(configs, 8) == 8
-        # M=12 is a tie between keys 8 and 16 (both distance 4); min resolves
-        # to 8. M=13 crosses the 8/16 boundary to 16.
-        assert self._nearest_key(configs, 12) == 8
-        assert self._nearest_key(configs, 13) == 16
-        assert self._nearest_key(configs, 16) == 16
-        assert self._nearest_key(configs, 20) == 16
-        assert self._nearest_key(configs, 69) == 69
-        assert self._nearest_key(configs, 100) == 69
-        assert self._nearest_key(configs, 256) == 256
-
-    def test_tie_breaks_to_first_minimal_key(self):
-        """On an exact midpoint tie, min returns the first (smaller) key."""
-        configs = {2: {}, 4: {}}
-        assert self._nearest_key(configs, 3) == 2
-
-    def test_guard_m_69_routes_to_guard_key(self):
-        """M=69 (indeterminate guard) routes to the 69 key when present."""
-        configs = {1: {}, 4: {}, 8: {}, 16: {}, 69: {}, 256: {}}
-        assert self._nearest_key(configs, 69) == 69
-        # M=69 is closer to 69 than to 16 or 256.
-        assert abs(69 - 69) < abs(69 - 16)
-        assert abs(69 - 69) < abs(69 - 256)
+    assert fp8_utils.get_w8a8_block_fp8_configs(4096, 2048, 128, 128) is None
 
 
-class TestUncoveredShapesPreserveFallback:
-    """Verify uncovered shapes still fall back to the default config."""
+@pytest.mark.parametrize(
+    ("M", "expected_key"),
+    [(1, 1), (2, 1), (3, 4), (6, 4), (7, 8), (12, 8), (13, 16), (69, 69),
+     (256, 256)],
+)
+def test_nearest_m_selection_uses_documented_boundaries(M, expected_key):
+    """Nearest-M selection retains its deterministic midpoint behavior."""
+    configs = {key: {} for key in (1, 4, 8, 16, 69, 256)}
 
-    @pytest.fixture(autouse=True)
-    def _cleanup(self):
-        yield
-        for N, K in SIX_SHAPES:
-            _remove_config_file(N, K)
+    assert _nearest_key(configs, M) == expected_key
 
-    def test_uncovered_shape_returns_none(self):
-        """An (N,K) with no config file returns None (fallback path)."""
-        # Install a config for one shape only.
-        _make_config_file(4096, 8192, {"1": {"BLOCK_SIZE_M": 16}})
-        # A different shape must still return None.
-        result = get_w8a8_block_fp8_configs(4096, 2048, 128, 128)
-        assert result is None
 
-    def test_all_six_shapes_start_uncovered(self):
-        """With no config files installed, all six shapes return None."""
-        for N, K in SIX_SHAPES:
-            assert get_w8a8_block_fp8_configs(N, K, 128, 128) is None
+@pytest.mark.parametrize("N,K", [(32768, 1024), (8192, 1024)])
+def test_m256_no_winner_configs_preserve_generic_fallback(N, K):
+    """Explicit M=256 keys preserve fallback where no tuned winner was found."""
+    config_dir = Path(fp8_utils.__file__).resolve().parent / "configs"
+    config = json.loads((config_dir / _config_filename(N, K)).read_text())
 
-    def test_installed_shape_is_covered_uncovered_siblings_are_not(self):
-        """Installing one shape covers only that shape; siblings stay None."""
-        _make_config_file(32768, 1024, {"1": {"BLOCK_SIZE_M": 16}})
-        covered = get_w8a8_block_fp8_configs(32768, 1024, 128, 128)
-        assert covered is not None and 1 in covered
-        for N, K in SIX_SHAPES:
-            if (N, K) != (32768, 1024):
-                assert (
-                    get_w8a8_block_fp8_configs(N, K, 128, 128) is None
-                ), f"{(N, K)} should be uncovered"
+    assert config["256"] == GENERIC_FALLBACK
+    int_configs = {int(key): value for key, value in config.items()}
+    assert _nearest_key(int_configs, 256) == 256
+
+
+def test_installed_configs_cover_only_the_six_confirmed_shapes():
+    """Each committed Radeon config file maps to an approved local shape."""
+    config_dir = Path(fp8_utils.__file__).resolve().parent / "configs"
+    installed = {
+        path.name
+        for path in config_dir.glob("*AMD_Radeon_8060S*dtype=fp8_w8a8*")
+    }
+    expected = {_config_filename(N, K) for N, K in SIX_SHAPES}
+
+    assert installed == expected
