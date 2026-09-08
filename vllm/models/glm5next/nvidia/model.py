@@ -653,6 +653,52 @@ class Glm5NextModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        hidden_states = torch.zeros(
+            batch_size, self.config.hidden_size, dtype=dtype, device=device
+        )
+        if not self.config.mhc:
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": torch.zeros(
+                        batch_size,
+                        self.config.hidden_size,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                }
+            )
+
+        num_streams = self.config.mhc_num_residual_streams
+        return IntermediateTensors(
+            {
+                "hidden_states": hidden_states,
+                "residual": torch.zeros(
+                    batch_size,
+                    num_streams,
+                    self.config.hidden_size,
+                    dtype=dtype,
+                    device=device,
+                ),
+                "post": torch.zeros(
+                    batch_size, num_streams, 1, dtype=torch.float32, device=device
+                ),
+                "comb": torch.zeros(
+                    batch_size,
+                    num_streams,
+                    num_streams,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            }
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -673,10 +719,12 @@ class Glm5NextModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
-            post = None
-            comb = None
+            if self.config.mhc:
+                post = intermediate_tensors["post"]
+                comb = intermediate_tensors["comb"]
+            else:
+                post = None
+                comb = None
 
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel:
@@ -688,14 +736,14 @@ class Glm5NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            assert residual is not None
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if self.config.mhc:
+                assert post is not None
+                assert comb is not None
+                tensors["post"] = post
+                tensors["comb"] = comb
+            return IntermediateTensors(tensors)
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -876,6 +924,9 @@ class Glm5NextForCausalLM(
         self.quant_config = quant_config
         self.model = Glm5NextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
         )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
