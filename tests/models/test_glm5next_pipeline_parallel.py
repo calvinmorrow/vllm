@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -211,6 +212,64 @@ def test_glm5next_causal_lm_delegates_pp_allocator(monkeypatch):
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(hf_config=config),
             quant_config=None,
+        )
+    )
+
+    assert supports_pp(target)
+    assert (
+        target.make_empty_intermediate_tensors(
+            batch_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        is sentinel
+    )
+
+
+@pytest.mark.cpu_test
+def test_glm5next_conditional_generation_delegates_pp_allocator(monkeypatch):
+    sentinel = IntermediateTensors({"hidden_states": torch.zeros(1, 1)})
+
+    class _LanguageModel(nn.Module):
+        def make_empty_intermediate_tensors(self, batch_size, dtype, device):
+            del batch_size, dtype, device
+            return sentinel
+
+    class _VisionModel(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            del args, kwargs
+
+    monkeypatch.setattr(
+        glm5next_mod.Glm5NextForConditionalGeneration,
+        "_mark_tower_model",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        glm5next_mod.Glm5NextForConditionalGeneration,
+        "_mark_language_model",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(glm5next_mod, "Glm5NextVisionTransformer", _VisionModel)
+    monkeypatch.setattr(
+        glm5next_mod,
+        "init_vllm_registered_model",
+        lambda **kwargs: _LanguageModel(),
+    )
+
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(),
+        vision_config=SimpleNamespace(rms_norm_eps=1e-6),
+    )
+    target = glm5next_mod.Glm5NextForConditionalGeneration(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=config,
+                multimodal_config=SimpleNamespace(
+                    mm_encoder_tp_mode="tensor",
+                    is_multimodal_pruning_enabled=lambda: False,
+                ),
+            )
         )
     )
 
