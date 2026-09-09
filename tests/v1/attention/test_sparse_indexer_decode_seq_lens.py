@@ -18,6 +18,7 @@ expansion consequences via the pure-torch expand/append pair that the fused
 kernel is documented to replicate.
 """
 
+import pytest
 import torch
 
 # Bootstrap the glm5next package before entering the indexer module: its
@@ -34,10 +35,12 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import (  # noqa: E402
 
 import vllm.model_executor.layers.sparse_attn_indexer_kpool as indexer_mod
 from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
+    SparseAttnIndexerKpool,
     _decode_topk_seq_lens,
     _fill_short_decode_causal_indices,
 )
 from vllm.platforms import current_platform
+from vllm.platforms import rocm as rocm_platform
 
 KPOOL = 4
 TOPK_TOKENS = 16
@@ -47,6 +50,56 @@ SELECT_K = TOPK_TOKENS // KPOOL
 def test_kpool_ops_dispatch_matches_platform():
     expected_backend = ".amd." if current_platform.is_rocm() else ".nvidia."
     assert expected_backend in indexer_mod.kpool_ops.__name__
+
+
+def test_gfx11_kpool_uses_generic_rocm_path_when_aiter_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    indexer = object.__new__(SparseAttnIndexerKpool)
+    indexer.use_fp4_cache = False
+    observed: dict[str, object] = {}
+
+    def forward_cuda(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return "generic-rocm-kpool"
+
+    monkeypatch.setattr(indexer_mod.rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(rocm_platform, "on_gfx11", lambda: True)
+    monkeypatch.setattr(indexer, "forward_cuda", forward_cuda)
+
+    result = indexer.forward_hip(
+        torch.empty(1, 1),
+        torch.empty(1, 1),
+        torch.empty(1, 1),
+        torch.empty(1, 1),
+        gate_score=torch.empty(1, 1),
+        compress_ape=torch.empty(1, 1),
+        index_kpool=4,
+        positions=torch.tensor([0]),
+    )
+
+    assert result == "generic-rocm-kpool"
+    assert observed["kwargs"]["index_kpool"] == 4
+
+
+def test_non_aiter_non_gfx11_kpool_remains_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    indexer = object.__new__(SparseAttnIndexerKpool)
+    indexer.use_fp4_cache = False
+
+    monkeypatch.setattr(indexer_mod.rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(rocm_platform, "on_gfx11", lambda: False)
+
+    with pytest.raises(RuntimeError, match="only supported on AITER"):
+        indexer.forward_hip(
+            torch.empty(1, 1),
+            torch.empty(1, 1),
+            torch.empty(1, 1),
+            torch.empty(1, 1),
+            index_kpool=4,
+        )
 
 
 def test_short_decode_fills_exact_causal_rows():
