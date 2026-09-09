@@ -39,6 +39,11 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    if speculative_config.method == "mtp":
+        vllm_config = replace(
+            vllm_config,
+            parallel_config=speculative_config.draft_parallel_config,
+        )
     if speculative_config.kv_cache_dtype is not None:
         vllm_config = replace(
             vllm_config,

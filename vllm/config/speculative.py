@@ -1496,7 +1496,9 @@ class SpeculativeConfig:
 
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        use_pipeline_parallelism=self.method != "mtp",
                     )
                 )
 
@@ -1686,13 +1688,20 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        *,
+        use_pipeline_parallelism: bool = True,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
-        This is mostly a copy of the target parallel config, except the tp_size.
+        MTP draft modules execute only on the target's last PP rank, so they do
+        not use pipeline parallelism themselves.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=(
+                target_parallel_config.pipeline_parallel_size
+                if use_pipeline_parallelism
+                else 1
+            ),
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,

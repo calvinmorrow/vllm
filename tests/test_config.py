@@ -2371,6 +2371,23 @@ def test_draft_sample_method_gumbel_is_rejected():
         )
 
 
+def test_mtp_draft_parallel_config_is_last_rank_local():
+    target_parallel_config = ParallelConfig(
+        pipeline_parallel_size=2,
+        tensor_parallel_size=2,
+    )
+
+    draft_parallel_config = SpeculativeConfig.create_draft_parallel_config(
+        target_parallel_config,
+        speculative_draft_tensor_parallel_size=2,
+        use_pipeline_parallelism=False,
+    )
+
+    assert target_parallel_config.pipeline_parallel_size == 2
+    assert draft_parallel_config.pipeline_parallel_size == 1
+    assert draft_parallel_config.tensor_parallel_size == 2
+
+
 @patch("vllm.config.speculative.ModelConfig")
 def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     """Regression test: MTP + runai_streamer should use model_weights (original
@@ -2395,15 +2412,16 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     target_config.quantization = None
     target_config.max_model_len = 4096
 
-    SpeculativeConfig(
+    speculative_config = SpeculativeConfig(
         method="mtp",
         num_speculative_tokens=1,
         target_model_config=target_config,
-        target_parallel_config=ParallelConfig(),
+        target_parallel_config=ParallelConfig(pipeline_parallel_size=2),
     )
 
     actual_model = mock_model_config_cls.call_args.kwargs["model"]
     assert actual_model == s3_url
+    assert speculative_config.draft_parallel_config.pipeline_parallel_size == 1
 
 
 def _make_qwen3_omni_dspark_configs():

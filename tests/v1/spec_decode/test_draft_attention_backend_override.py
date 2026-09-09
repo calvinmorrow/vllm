@@ -15,6 +15,11 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 
 @dataclass
+class _ParallelConfig:
+    pipeline_parallel_size: int
+
+
+@dataclass
 class _AttentionConfig:
     backend: str | None = None
 
@@ -35,6 +40,8 @@ class _SpeculativeConfig:
     moe_backend: str | None = None
     kv_cache_dtype: str | None = None
     draft_model_config: object = None
+    draft_parallel_config: _ParallelConfig | None = None
+    method: str = "eagle"
 
 
 @dataclass
@@ -43,6 +50,7 @@ class _VllmConfig:
     kernel_config: _KernelConfig
     cache_config: _CacheConfig
     speculative_config: _SpeculativeConfig
+    parallel_config: _ParallelConfig
 
 
 def _config(target_backend: str, draft_backend: str | None) -> _VllmConfig:
@@ -51,6 +59,7 @@ def _config(target_backend: str, draft_backend: str | None) -> _VllmConfig:
         kernel_config=_KernelConfig(),
         cache_config=_CacheConfig(),
         speculative_config=_SpeculativeConfig(attention_backend=draft_backend),
+        parallel_config=_ParallelConfig(pipeline_parallel_size=2),
     )
 
 
