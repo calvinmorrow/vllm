@@ -377,6 +377,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         continue
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
+                    if name_mapped not in params_dict:
+                        continue
                     param = params_dict[name_mapped]
                     weight_loader = typing.cast(
                         Callable[..., bool], param.weight_loader

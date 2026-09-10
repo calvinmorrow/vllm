@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from vllm.models.glm5next.nvidia import model as glm5next_mod
+from vllm.models.glm5next.nvidia import mtp as glm5next_mtp
 from vllm.model_executor.models.interfaces import supports_pp
 from vllm.sequence import IntermediateTensors
 
@@ -47,6 +48,43 @@ class _BoundaryLayer(nn.Module):
             post if self.output_post is None else self.output_post,
             comb if self.output_comb is None else self.output_comb,
         )
+
+
+@pytest.mark.cpu_test
+def test_glm5next_mtp_skips_absent_expert_weight(monkeypatch):
+    mtp = glm5next_mtp.Glm5NextMTP.__new__(glm5next_mtp.Glm5NextMTP)
+    nn.Module.__init__(mtp)
+    mtp.config = SimpleNamespace(
+        num_hidden_layers=44,
+        num_nextn_predict_layers=2,
+        n_routed_experts=1,
+        mla_nope=False,
+        qk_rope_head_dim=0,
+    )
+    mtp.model = SimpleNamespace(mtp_start_layer_idx=44, num_mtp_layers=0)
+    monkeypatch.setattr(
+        glm5next_mtp,
+        "fused_moe_make_expert_params_mapping",
+        lambda *args, **kwargs: [
+            (
+                "experts.routed_experts.w2_qweight",
+                "experts.0.down_proj.qweight",
+                0,
+                "w2",
+            )
+        ],
+    )
+
+    loaded = mtp.load_weights(
+        [
+            (
+                "model.layers.45.mlp.experts.0.down_proj.qweight",
+                torch.tensor(1),
+            )
+        ]
+    )
+
+    assert loaded == set()
 
 
 def _model(mhc: bool, num_streams: int = 3) -> glm5next_mod.Glm5NextModel:
