@@ -97,3 +97,16 @@ def test_override_does_not_mutate_the_target_config():
     cfg = _config("FLASHINFER", "TRITON_ATTN")
     _capture_draft_config(cfg)
     assert cfg.attention_config.backend == "FLASHINFER"
+
+
+def test_mtp_draft_uses_its_last_rank_local_parallel_config():
+    cfg = _config("FLASHINFER", None)
+    cfg.speculative_config.method = "mtp"
+    cfg.speculative_config.draft_parallel_config = _ParallelConfig(
+        pipeline_parallel_size=1
+    )
+
+    used = _capture_draft_config(cfg)
+
+    assert cfg.parallel_config.pipeline_parallel_size == 2
+    assert used.parallel_config.pipeline_parallel_size == 1
